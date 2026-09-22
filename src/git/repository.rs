@@ -1,12 +1,13 @@
 //! Repository discovery and high-level operations.
 
-use std::ffi::{OsStr, OsString};
+use std::ffi::OsString;
 use std::os::unix::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
 
 use crate::git::Result;
 use crate::git::command;
 use crate::git::error::Error;
+use crate::model::diff::Diff;
 use crate::model::status::Status;
 
 /// A Git repository, rooted at its working tree root.
@@ -24,8 +25,7 @@ impl Repository {
     /// `path` may be the repository root or any subdirectory of it; the
     /// repository root is resolved with `git rev-parse --show-toplevel`.
     pub fn discover(path: &Path) -> Result<Self> {
-        let args = [OsStr::new("rev-parse"), OsStr::new("--show-toplevel")];
-        let output = match command::run(path, &args) {
+        let output = match command::run(path, &["rev-parse", "--show-toplevel"]) {
             Ok(output) => output,
             // Any `rev-parse` failure here means the path is not inside a work tree.
             Err(Error::Git(_)) => {
@@ -63,5 +63,15 @@ impl Repository {
     /// Reads the current status of the working tree and index.
     pub fn status(&self) -> Result<Status> {
         crate::git::status::status(self)
+    }
+
+    /// Diff of the working tree against the index (unstaged changes).
+    pub fn working_tree_diff(&self) -> Result<Diff> {
+        crate::git::diff::working_tree_diff(self)
+    }
+
+    /// Diff of the index against HEAD (staged changes).
+    pub fn staged_diff(&self) -> Result<Diff> {
+        crate::git::diff::staged_diff(self)
     }
 }

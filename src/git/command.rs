@@ -26,12 +26,16 @@ pub struct GitOutput {
 ///
 /// `root` must be the repository root (or any directory inside it). Arguments
 /// are passed verbatim, without a shell, so pathnames never need quoting.
-pub fn run(root: &Path, args: &[&OsStr]) -> Result<GitOutput> {
+pub fn run<S: AsRef<OsStr>>(root: &Path, args: &[S]) -> Result<GitOutput> {
     run_with_stdin(root, args, None)
 }
 
 /// Like [`run`], but feeds `stdin` to the command (e.g. a patch for `git apply`).
-pub fn run_with_stdin(root: &Path, args: &[&OsStr], stdin: Option<&[u8]>) -> Result<GitOutput> {
+pub fn run_with_stdin<S: AsRef<OsStr>>(
+    root: &Path,
+    args: &[S],
+    stdin: Option<&[u8]>,
+) -> Result<GitOutput> {
     let command_display = format_command(root, args);
 
     let mut command = Command::new("git");
@@ -97,13 +101,16 @@ pub fn run_with_stdin(root: &Path, args: &[&OsStr], stdin: Option<&[u8]>) -> Res
 }
 
 /// Renders the full command line for logs and error details.
-fn format_command(root: &Path, args: &[&OsStr]) -> String {
+fn format_command<S: AsRef<OsStr>>(root: &Path, args: &[S]) -> String {
     let mut parts = vec![
         "git".to_owned(),
         "-C".to_owned(),
         root.display().to_string(),
         "--no-pager".to_owned(),
     ];
-    parts.extend(args.iter().map(|arg| arg.to_string_lossy().into_owned()));
+    parts.extend(
+        args.iter()
+            .map(|arg| arg.as_ref().to_string_lossy().into_owned()),
+    );
     parts.join(" ")
 }

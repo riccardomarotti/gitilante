@@ -4,7 +4,6 @@
 //! unescaped pathnames, so paths containing spaces, tabs, newlines or Unicode
 //! survive untouched.
 
-use std::ffi::OsStr;
 use std::ffi::OsString;
 use std::os::unix::ffi::OsStringExt;
 use std::path::PathBuf;
@@ -20,12 +19,12 @@ type ParseResult<T> = std::result::Result<T, String>;
 /// Reads the repository status with `git status --porcelain=v2 -z --branch`.
 pub fn status(repo: &Repository) -> crate::git::Result<Status> {
     let args = [
-        OsStr::new("status"),
-        OsStr::new("--porcelain=v2"),
-        OsStr::new("-z"),
-        OsStr::new("--branch"),
+        "status",
+        "--porcelain=v2",
+        "-z",
+        "--branch",
         // Explicit, stable behaviour regardless of user configuration.
-        OsStr::new("--untracked-files=normal"),
+        "--untracked-files=normal",
     ];
     let output = command::run(repo.root(), &args)?;
     parse(&output.stdout).map_err(|detail| Error::MalformedOutput {

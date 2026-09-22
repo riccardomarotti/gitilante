@@ -52,21 +52,59 @@ impl TestRepo {
 
     /// Runs `git` in the repository, reporting success, stdout and stderr.
     pub fn try_git(&self, args: &[&str]) -> (bool, String, String) {
-        let output = Command::new("git")
+        let (success, stdout, stderr) = self.git_with_stdin_raw(args, &[]);
+        (
+            success,
+            String::from_utf8_lossy(&stdout).into_owned(),
+            String::from_utf8_lossy(&stderr).into_owned(),
+        )
+    }
+
+    /// Runs `git` in the repository feeding `stdin`, reporting success, stdout
+    /// and stderr as text (used for `git apply -`).
+    pub fn git_with_stdin(&self, args: &[&str], stdin: &[u8]) -> (bool, String, String) {
+        let (success, stdout, stderr) = self.git_with_stdin_raw(args, stdin);
+        (
+            success,
+            String::from_utf8_lossy(&stdout).into_owned(),
+            String::from_utf8_lossy(&stderr).into_owned(),
+        )
+    }
+
+    /// Runs `git` in the repository feeding `stdin`, with raw output bytes.
+    pub fn git_with_stdin_raw(&self, args: &[&str], stdin: &[u8]) -> (bool, Vec<u8>, Vec<u8>) {
+        use std::io::Write;
+        let mut command = Command::new("git");
+        command
             .arg("-C")
             .arg(&self.root)
             .arg("--no-pager")
-            .args(args)
+            .args(args);
+        command
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env("GIT_CONFIG_NOSYSTEM", "1")
-            .env("GIT_TERMINAL_PROMPT", "0")
-            .output()
+            .env("GIT_TERMINAL_PROMPT", "0");
+        let mut child = command
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
             .expect("run git");
-        (
-            output.status.success(),
-            String::from_utf8_lossy(&output.stdout).into_owned(),
-            String::from_utf8_lossy(&output.stderr).into_owned(),
-        )
+        child
+            .stdin
+            .take()
+            .expect("stdin was piped")
+            .write_all(stdin)
+            .expect("write stdin");
+        let output = child.wait_with_output().expect("wait for git");
+        (output.status.success(), output.stdout, output.stderr)
+    }
+
+    /// Runs `git` in the repository and returns its raw stdout, panicking on failure.
+    pub fn git_bytes(&self, args: &[&str]) -> Vec<u8> {
+        let (success, stdout, _) = self.git_with_stdin_raw(args, &[]);
+        assert!(success, "git {args:?} failed");
+        stdout
     }
 
     /// Writes a file (creating parent directories), replacing any content.
@@ -101,8 +139,24 @@ impl TestRepo {
 
     /// Reads the current status through the Gitilante backend.
     pub fn status(&self) -> gitilante::model::status::Status {
-        let repo = gitilante::git::Repository::discover(self.root()).expect("discover repository");
-        repo.status().expect("read status")
+        self.repository().status().expect("read status")
+    }
+
+    /// Opens the repository through the Gitilante backend.
+    pub fn repository(&self) -> gitilante::git::Repository {
+        gitilante::git::Repository::discover(self.root()).expect("discover repository")
+    }
+
+    /// Reads the working tree diff through the Gitilante backend.
+    pub fn working_tree_diff(&self) -> gitilante::model::diff::Diff {
+        self.repository()
+            .working_tree_diff()
+            .expect("read working tree diff")
+    }
+
+    /// Reads the staged diff through the Gitilante backend.
+    pub fn staged_diff(&self) -> gitilante::model::diff::Diff {
+        self.repository().staged_diff().expect("read staged diff")
     }
 
     /// Commits every current change with the given message.
