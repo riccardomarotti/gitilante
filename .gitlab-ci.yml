@@ -13,6 +13,7 @@ stages:
   - test
   - build
   - package
+  - publish
 
 default:
   image: archlinux:base-devel
@@ -76,3 +77,17 @@ package:
       - dist/aur/.SRCINFO
       - dist/aur/*.pkg.tar.zst
     expire_in: 1 month
+
+# Updates the AUR package from the metadata built in the package job. Only a
+# valid release tag gets here, and only after every check has succeeded
+# (DEPLOY.md section 20). The AUR SSH key comes from the protected masked
+# variable AUR_SSH_PRIVATE_KEY (section 13).
+publish-aur:
+  stage: publish
+  extends: .release
+  needs: [check-version, test, build, package]
+  before_script:
+    - pacman -Syu --noconfirm --needed git openssh
+  script:
+    - echo "Publishing AUR..."
+    - scripts/publish-aur.sh
