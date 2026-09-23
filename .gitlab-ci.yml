@@ -55,6 +55,10 @@ build:
     - echo "Building Gitilante..."
     - cargo fetch --locked
     - cargo build --frozen --release
+  artifacts:
+    paths:
+      - target/release/gitilante
+    expire_in: 1 day
 
 # Generates the AUR package metadata and really builds the Arch package in a
 # clean Arch environment: dependency resolution must be verified too.
@@ -91,3 +95,47 @@ publish-aur:
   script:
     - echo "Publishing AUR..."
     - scripts/publish-aur.sh
+
+# Builds the official binary bundle from the build job binary, publishes it to
+# the GitLab Generic Package Registry and really builds the binary package
+# (BINPACKAGE.md sections 6-27). The runtime libraries are needed to verify the
+# binary with ldd and to resolve the PKGBUILD depends for makepkg.
+package-bin:
+  stage: package
+  extends: .release
+  needs: [check-version, test, build]
+  before_script:
+    - pacman -Syu --noconfirm --needed curl git gtksourceview5 gtk4 libadwaita
+  script:
+    - V="${CI_COMMIT_TAG#v}"
+    - echo "Building binary bundle..."
+    - scripts/build-binary-bundle.sh "$V"
+    - echo "Publishing binary bundle..."
+    - scripts/publish-binary-bundle.sh "$V"
+    - echo "Generating PKGBUILD (gitilante-bin)..."
+    - echo "Generating .SRCINFO (gitilante-bin)..."
+    - echo "Testing Arch binary package..."
+    # makepkg refuses to run as root (see the package job).
+    - useradd -m builder
+    - chown -R builder:builder .
+    - su builder -c "scripts/generate-aur-bin-package.sh '$V' && cd dist/aur-bin && makepkg --noconfirm"
+  artifacts:
+    paths:
+      - dist/bin/*.tar.gz
+      - dist/aur-bin/PKGBUILD
+      - dist/aur-bin/.SRCINFO
+      - dist/aur-bin/*.pkg.tar.zst
+    expire_in: 1 month
+
+# Updates the binary AUR package from the metadata built in the package-bin
+# job (BINPACKAGE.md section 28). It inherits the idempotence and the SSH
+# handling of publish-aur.sh.
+publish-aur-bin:
+  stage: publish
+  extends: .release
+  needs: [check-version, test, build, package-bin]
+  before_script:
+    - pacman -Syu --noconfirm --needed git openssh
+  script:
+    - echo "Publishing AUR (gitilante-bin)..."
+    - AUR_PACKAGE=gitilante-bin AUR_METADATA_DIR=dist/aur-bin scripts/publish-aur.sh

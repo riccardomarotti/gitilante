@@ -16,6 +16,8 @@
 #                         configuration are used, so the script also works
 #                         locally)
 #   AUR_PACKAGE           AUR package name (default: gitilante)
+#   AUR_METADATA_DIR      directory with PKGBUILD and .SRCINFO
+#                         (default: dist/aur)
 #   AUR_GIT_USER_NAME     author name for the AUR commit
 #   AUR_GIT_USER_EMAIL    author email for the AUR commit
 #
@@ -36,7 +38,7 @@ die() { printf 'error: %s\n' "$*" >&2; exit 1; }
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
-METADATA_DIR="dist/aur"
+METADATA_DIR="${AUR_METADATA_DIR:-dist/aur}"
 [ -f "$METADATA_DIR/PKGBUILD" ] || die "missing $METADATA_DIR/PKGBUILD (run scripts/generate-aur-package.sh first)"
 [ -f "$METADATA_DIR/.SRCINFO" ] || die "missing $METADATA_DIR/.SRCINFO (run scripts/generate-aur-package.sh first)"
 [ -f "packaging/aur/known_hosts" ] || die "missing packaging/aur/known_hosts"

@@ -73,11 +73,30 @@ cargo fmt
 
 ## Packaging
 
-Release packaging lives in `packaging/aur/` (a `PKGBUILD` template) and
-`scripts/`. To generate the AUR package metadata locally:
+Gitilante is available on the AUR in two flavors:
+
+```bash
+yay -S gitilante       # builds the release sources with Cargo
+yay -S gitilante-bin   # installs the official prebuilt binary
+```
+
+Both install the same application (`gitilante`, its `gila` alias and the
+desktop/icon/metainfo files) and conflict with each other.
+
+Release packaging lives in `packaging/aur/` and `packaging/aur-bin/`
+(`PKGBUILD` templates) and `scripts/`. To generate the AUR package metadata
+locally:
 
 ```bash
 ./scripts/generate-aur-package.sh 0.1.0        # from the GitLab tag archive
 ./scripts/generate-aur-package.sh 0.1.0 --local  # testing only, pre-tag
 cd dist/aur && makepkg
+```
+
+For the binary package (the bundle must already exist):
+
+```bash
+./scripts/build-binary-bundle.sh 0.1.0
+./scripts/generate-aur-bin-package.sh 0.1.0 --archive dist/bin/gitilante-0.1.0-linux-x86_64.tar.gz
+cd dist/aur-bin && makepkg
 ```
