@@ -1,0 +1,78 @@
+# Release pipeline for Gitilante.
+#
+# Branch pushes run the checks and the build; a release tag vX.Y.Z additionally
+# generates the AUR package metadata and really builds the Arch package.
+# Publishing to the AUR (added later) must only ever happen from a valid
+# release tag and only after every stage here has succeeded (see DEPLOY.md).
+#
+# The pipeline orchestrates the scripts in scripts/: keep the logic there, not
+# here, so it stays testable outside of GitLab CI.
+
+stages:
+  - check
+  - test
+  - build
+  - package
+
+default:
+  image: archlinux:base-devel
+  interruptible: true
+
+# Release tags only: vMAJOR.MINOR.PATCH.
+.release:
+  rules:
+    - if: '$CI_COMMIT_TAG =~ /^v[0-9]+\.[0-9]+\.[0-9]+$/'
+
+# Branch pushes and any tag.
+.checks:
+  rules:
+    - if: '$CI_COMMIT_BRANCH'
+    - if: '$CI_COMMIT_TAG'
+
+.install-deps:
+  before_script:
+    - pacman -Syu --noconfirm --needed git rust gtk4 libadwaita
+
+check-version:
+  stage: check
+  extends: .release
+  script:
+    - scripts/check-version.sh "$CI_COMMIT_TAG"
+
+test:
+  stage: test
+  extends: [.checks, .install-deps]
+  script:
+    - echo "Running tests..."
+    - cargo fetch --locked
+    - cargo test --frozen
+
+build:
+  stage: build
+  extends: [.checks, .install-deps]
+  script:
+    - echo "Building Gitilante..."
+    - cargo fetch --locked
+    - cargo build --frozen --release
+
+# Generates the AUR package metadata and really builds the Arch package in a
+# clean Arch environment: dependency resolution must be verified too.
+package:
+  stage: package
+  extends: [.release, .install-deps]
+  needs: [check-version, test, build]
+  script:
+    - echo "Generating PKGBUILD..."
+    - scripts/generate-aur-package.sh "${CI_COMMIT_TAG#v}" --pkgrel 1
+    - echo "Generating .SRCINFO..."
+    - echo "Testing Arch package..."
+    # makepkg refuses to run as root.
+    - useradd -m builder
+    - chown -R builder:builder dist
+    - su builder -c "cd dist/aur && makepkg --noconfirm"
+  artifacts:
+    paths:
+      - dist/aur/PKGBUILD
+      - dist/aur/.SRCINFO
+      - dist/aur/*.pkg.tar.zst
+    expire_in: 1 month
