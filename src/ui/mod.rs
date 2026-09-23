@@ -3,13 +3,13 @@
 pub mod app;
 pub mod changes;
 pub mod diff_view;
+pub mod history;
 pub mod main_window;
 pub mod worker;
 
 use std::path::{Path, PathBuf};
 
 use crate::model::status::ChangeKind;
-
 /// What the user currently selected in the sidebar.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Selection {
@@ -19,15 +19,8 @@ pub enum Selection {
     Unstaged(PathBuf),
     /// An untracked file.
     Untracked(PathBuf),
-}
-
-impl Selection {
-    /// Path of the selected entry.
-    pub fn path(&self) -> &Path {
-        match self {
-            Self::Staged(path) | Self::Unstaged(path) | Self::Untracked(path) => path,
-        }
-    }
+    /// A commit of the History view (by object name).
+    Commit(String),
 }
 
 /// Side of the repository a diff is taken from.
@@ -37,6 +30,8 @@ pub enum DiffSide {
     Staged,
     /// The working tree (`git diff`).
     Unstaged,
+    /// A historical commit (`git show`); hunks get their actions in Fase 6.
+    History,
 }
 
 /// Short letter describing a change kind.

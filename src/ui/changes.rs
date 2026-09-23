@@ -105,31 +105,27 @@ impl ChangesView {
         items.push(None);
         for entry in status.staged_entries() {
             let letter = entry.staged_change().map(change_letter).unwrap_or(' ');
-            let selection = Selection::Staged(entry.path.clone());
-            self.push_entry(entry, letter, &selection, &[("Unstage", Op::Unstage)]);
-            items.push(Some(selection));
+            items.push(Some(Selection::Staged(entry.path.clone())));
+            self.push_entry(entry, letter, &[("Unstage", Op::Unstage)]);
         }
 
         self.push_header("Unstaged");
         items.push(None);
         for entry in status.unstaged_entries() {
             let letter = entry.unstaged_change().map(change_letter).unwrap_or(' ');
-            let selection = Selection::Unstaged(entry.path.clone());
+            items.push(Some(Selection::Unstaged(entry.path.clone())));
             self.push_entry(
                 entry,
                 letter,
-                &selection,
                 &[("Stage", Op::Stage), ("Discard", Op::Discard)],
             );
-            items.push(Some(selection));
         }
 
         self.push_header("Untracked");
         items.push(None);
         for entry in status.untracked_entries() {
-            let selection = Selection::Untracked(entry.path.clone());
-            self.push_entry(entry, '?', &selection, &[("Stage", Op::Stage)]);
-            items.push(Some(selection));
+            items.push(Some(Selection::Untracked(entry.path.clone())));
+            self.push_entry(entry, '?', &[("Stage", Op::Stage)]);
         }
 
         // Restore the selection on the matching row, if any.
@@ -149,6 +145,13 @@ impl ChangesView {
         self.shared.rebuilding.set(false);
     }
 
+    /// Clears the row selection (used when a History commit is selected).
+    pub fn clear_selection(&self) {
+        self.shared.rebuilding.set(true);
+        self.list.unselect_all();
+        self.shared.rebuilding.set(false);
+    }
+
     /// Appends a non-selectable section header row.
     fn push_header(&self, title: &str) {
         let row = ListBoxRow::new();
@@ -165,13 +168,7 @@ impl ChangesView {
     }
 
     /// Appends a file row with its action buttons.
-    fn push_entry(
-        &self,
-        entry: &StatusEntry,
-        letter: char,
-        selection: &Selection,
-        buttons: &[(&str, Op)],
-    ) {
+    fn push_entry(&self, entry: &StatusEntry, letter: char, buttons: &[(&str, Op)]) {
         let row = ListBoxRow::new();
         row.set_activatable(true);
 
@@ -198,7 +195,7 @@ impl ChangesView {
             button.add_css_class("flat");
             button.set_valign(Align::Center);
             button.set_tooltip_text(Some(&tooltip(*op, &entry.path)));
-            let path = selection.path().to_path_buf();
+            let path = entry.path.clone();
             let shared = self.shared.clone();
             let op = *op;
             button.connect_clicked(move |_| match op {

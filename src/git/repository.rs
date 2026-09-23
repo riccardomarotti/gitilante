@@ -8,6 +8,7 @@ use crate::git::Result;
 use crate::git::command;
 use crate::git::error::Error;
 use crate::git::patch::{self, ApplyTarget};
+use crate::model::commit::Commit;
 use crate::model::diff::{Diff, FileDiff, Hunk};
 use crate::model::status::{Status, StatusEntry};
 
@@ -74,6 +75,16 @@ impl Repository {
     /// Diff of the index against HEAD (staged changes).
     pub fn staged_diff(&self) -> Result<Diff> {
         crate::git::diff::staged_diff(self)
+    }
+
+    /// Loads up to `max_count` commits of HEAD starting at `skip` (SPEC §16).
+    pub fn history(&self, skip: usize, max_count: usize) -> Result<Vec<Commit>> {
+        crate::git::history::history(self, skip, max_count)
+    }
+
+    /// Diff of a single commit (SPEC §17).
+    pub fn commit_diff(&self, oid: &str) -> Result<Diff> {
+        crate::git::history::commit_diff(self, oid)
     }
 
     /// Stages a single hunk of a working tree diff into the index (SPEC §12).

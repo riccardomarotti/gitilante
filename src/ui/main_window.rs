@@ -1,9 +1,10 @@
-//! Main window: sidebar + diff view, refresh handling and error reporting.
+//! Main window: sidebar (Changes + History) and diff view.
 //!
-//! Responsibilities (SPEC sections 14, 20, 21, 29):
+//! Responsibilities (SPEC sections 14, 20, 21, 22, 29):
 //! - runs every Git operation on the worker thread and refreshes afterwards;
-//! - drops stale results with a generation counter;
+//! - drops stale results with generation counters;
 //! - refreshes when the window regains focus;
+//! - loads history in blocks and commit diffs only when selected;
 //! - reports errors with toasts, reserving dialogs for decisions (discard).
 
 use std::cell::RefCell;
@@ -12,16 +13,23 @@ use std::rc::{Rc, Weak};
 
 use gtk4::gio;
 use gtk4::prelude::*;
-use gtk4::{Box as GtkBox, Button, Orientation, Paned, PolicyType, ScrolledWindow};
+use gtk4::{Adjustment, Box as GtkBox, Button, Orientation, Paned, PolicyType, ScrolledWindow};
 use libadwaita as adw;
 use libadwaita::prelude::*;
 
 use crate::git::Error;
 use crate::git::repository::Repository;
+use crate::model::commit::Commit;
 use crate::model::diff::{Diff, FileDiff, Hunk};
 use crate::model::status::{Status, StatusEntry};
 use crate::ui::worker::Worker;
-use crate::ui::{DiffSide, Selection, changes, diff_view, short_path};
+use crate::ui::{DiffSide, Selection, changes, diff_view, history, short_path};
+
+/// Commits per history block (SPEC section 16).
+const HISTORY_PAGE: usize = 200;
+
+/// Distance from the sidebar bottom that triggers loading more history.
+const HISTORY_SCROLL_THRESHOLD: f64 = 300.0;
 
 /// Everything read from Git in one refresh.
 struct RefreshData {
@@ -37,6 +45,16 @@ struct State {
     selection: Option<Selection>,
     /// Incremented on every refresh; results of older refreshes are dropped.
     generation: u64,
+    /// Commits loaded so far.
+    commits: Vec<Commit>,
+    /// True while a history request is in flight (requests are single flight).
+    history_loading: bool,
+    /// True when Git returned fewer commits than requested.
+    history_exhausted: bool,
+    /// Diff of the selected commit, loaded lazily (SPEC section 22).
+    commit_diff: Option<(String, Diff)>,
+    /// Bumped on every selection change; stale commit diffs are dropped.
+    commit_diff_generation: u64,
 }
 
 struct Inner {
@@ -48,6 +66,7 @@ struct Inner {
     toast_overlay: adw::ToastOverlay,
     subtitle: adw::WindowTitle,
     changes: changes::ChangesView,
+    history_view: history::HistoryView,
     diff_box: GtkBox,
     diff_scroll: ScrolledWindow,
 }
@@ -88,6 +107,7 @@ impl Inner {
                 let weak = self_weak.clone();
                 Box::new(move |selection| {
                     if let Some(inner) = weak.upgrade() {
+                        inner.history_view.clear_selection();
                         inner.select(selection);
                     }
                 })
@@ -104,10 +124,36 @@ impl Inner {
             },
         });
 
+        let history_view = history::HistoryView::new(history::Callbacks {
+            select: {
+                let weak = self_weak.clone();
+                Box::new(move |selection| {
+                    if let Some(inner) = weak.upgrade() {
+                        inner.changes.clear_selection();
+                        inner.select(selection);
+                    }
+                })
+            },
+            load_more: {
+                let weak = self_weak.clone();
+                Box::new(move || {
+                    if let Some(inner) = weak.upgrade() {
+                        inner.request_history_more();
+                    }
+                })
+            },
+        });
+
+        // The whole sidebar column scrolls as one, Changes above History.
+        let sidebar = GtkBox::new(Orientation::Vertical, 0);
+        sidebar.append(changes.widget());
+        sidebar.append(history_view.widget());
+
         let sidebar_scroll = ScrolledWindow::new();
-        sidebar_scroll.set_child(Some(changes.widget()));
+        sidebar_scroll.set_child(Some(&sidebar));
         sidebar_scroll.set_policy(PolicyType::Never, PolicyType::Automatic);
-        sidebar_scroll.set_width_request(280);
+        sidebar_scroll.set_width_request(320);
+        hook_history_scroll(&sidebar_scroll.vadjustment(), self_weak.clone());
 
         let diff_scroll = ScrolledWindow::new();
         diff_scroll.set_policy(PolicyType::Automatic, PolicyType::Automatic);
@@ -119,7 +165,7 @@ impl Inner {
         let paned = Paned::new(Orientation::Horizontal);
         paned.set_start_child(Some(&sidebar_scroll));
         paned.set_end_child(Some(&diff_scroll));
-        paned.set_position(300);
+        paned.set_position(340);
         paned.set_resize_start_child(false);
         paned.set_shrink_start_child(false);
         paned.set_vexpand(true);
@@ -172,12 +218,15 @@ impl Inner {
             toast_overlay,
             subtitle,
             changes,
+            history_view,
             diff_box,
             diff_scroll,
         }
     }
 
-    /// Reloads status and diffs from Git (SPEC section 20).
+    // --- data loading ----------------------------------------------------
+
+    /// Reloads status, diffs and history from Git (SPEC section 20).
     fn refresh(&self) {
         let generation = {
             let mut state = self.state.borrow_mut();
@@ -200,69 +249,216 @@ impl Inner {
                 }
             },
         );
+        self.request_history_replace();
+    }
+
+    /// Reloads the history blocks loaded so far.
+    fn request_history_replace(&self) {
+        let count = {
+            let state = self.state.borrow();
+            state.commits.len().max(HISTORY_PAGE)
+        };
+        self.request_history(false, 0, count);
+    }
+
+    /// Loads the next block of history (SPEC sections 16 and 22).
+    fn request_history_more(&self) {
+        let skip = self.state.borrow().commits.len();
+        self.request_history(true, skip, HISTORY_PAGE);
+    }
+
+    /// Single-flight history request: `append` adds to the loaded commits,
+    /// otherwise the list is replaced.
+    fn request_history(&self, append: bool, skip: usize, count: usize) {
+        {
+            let mut state = self.state.borrow_mut();
+            if state.history_loading || (append && state.history_exhausted) {
+                return;
+            }
+            state.history_loading = true;
+        }
+        self.render_history();
+
+        let repo = self.repo.clone();
+        let weak = self.self_weak.clone();
+        self.worker.run(
+            move || repo.history(skip, count),
+            move |result| {
+                if let Some(inner) = weak.upgrade() {
+                    inner.finish_history(append, count, result);
+                }
+            },
+        );
+    }
+
+    fn finish_history(&self, append: bool, requested: usize, result: Result<Vec<Commit>, Error>) {
+        match result {
+            Ok(commits) => {
+                let mut state = self.state.borrow_mut();
+                state.history_loading = false;
+                state.history_exhausted = commits.len() < requested;
+                if append {
+                    state.commits.extend(commits);
+                } else {
+                    state.commits = commits;
+                }
+            }
+            Err(error) => {
+                self.state.borrow_mut().history_loading = false;
+                self.show_error(&error);
+            }
+        }
+        self.render_history();
     }
 
     /// Applies a refresh result unless a newer refresh superseded it.
     fn finish_refresh(&self, generation: u64, result: Result<RefreshData, Error>) {
-        let mut state = self.state.borrow_mut();
-        if state.generation != generation {
-            return; // stale result (SPEC section 21)
+        {
+            let mut state = self.state.borrow_mut();
+            if state.generation != generation {
+                return; // stale result (SPEC section 21)
+            }
+            match result {
+                Ok(data) => {
+                    let selection = state
+                        .selection
+                        .clone()
+                        .filter(|selection| selection_exists(&data.status, selection));
+                    state.data = Some(data);
+                    // Show a diff right away: when nothing is selected (startup
+                    // or a selection that vanished), pick the first entry.
+                    state.selection = selection.or_else(|| {
+                        let data = state.data.as_ref().expect("just set");
+                        first_selection(&data.status)
+                    });
+                }
+                Err(error) => {
+                    drop(state);
+                    self.show_error(&error);
+                    return;
+                }
+            }
         }
+        self.render_changes();
+        self.render_diff();
+        let (root, status) = {
+            let state = self.state.borrow();
+            let data = state.data.as_ref().expect("refresh just set it");
+            (self.repo.root().to_path_buf(), data.status.clone())
+        };
+        self.subtitle.set_subtitle(&subtitle_text(&root, &status));
+    }
+
+    /// Loads the diff of a commit, dropping results that became stale.
+    fn load_commit_diff(&self, generation: u64, oid: String) {
+        let repo = self.repo.clone();
+        let weak = self.self_weak.clone();
+        let requested = oid.clone();
+        self.worker.run(
+            move || repo.commit_diff(&oid),
+            move |result| {
+                if let Some(inner) = weak.upgrade() {
+                    inner.finish_commit_diff(generation, requested, result);
+                }
+            },
+        );
+    }
+
+    fn finish_commit_diff(&self, generation: u64, oid: String, result: Result<Diff, Error>) {
         match result {
-            Ok(data) => {
-                let selection = state
-                    .selection
-                    .clone()
-                    .filter(|selection| selection_exists(&data.status, selection));
-                state.data = Some(data);
-                // Show a diff right away: when nothing is selected (startup or a
-                // selection that vanished), pick the first available entry.
-                state.selection = selection.or_else(|| {
-                    let data = state.data.as_ref().expect("just set");
-                    first_selection(&data.status)
-                });
+            Ok(diff) => {
+                let mut state = self.state.borrow_mut();
+                if state.commit_diff_generation != generation
+                    || state.selection.as_ref() != Some(&Selection::Commit(oid.clone()))
+                {
+                    return; // stale result (SPEC section 21)
+                }
+                state.commit_diff = Some((oid, diff));
             }
             Err(error) => {
-                drop(state);
                 self.show_error(&error);
-                return;
             }
         }
-        let data = state.data.as_ref().expect("just set");
-        let selection = state.selection.clone();
-        self.subtitle
-            .set_subtitle(&subtitle_text(&self.repo, &data.status));
-        self.changes.update(&data.status, selection.as_ref());
-        self.render_diff(data, selection.as_ref());
+        self.render_diff();
     }
+
+    // --- selection and rendering -----------------------------------------
 
     /// Handles sidebar row selection.
     fn select(&self, selection: Selection) {
-        self.state.borrow_mut().selection = Some(selection);
-        let state = self.state.borrow();
-        let Some(data) = state.data.as_ref() else {
-            return;
+        let mut state = self.state.borrow_mut();
+        state.commit_diff_generation += 1;
+        let generation = state.commit_diff_generation;
+
+        let cached = match &selection {
+            Selection::Commit(oid) => state
+                .commit_diff
+                .as_ref()
+                .is_some_and(|(cached, _)| cached == oid),
+            _ => true,
         };
-        self.render_diff(data, state.selection.as_ref());
+        state.selection = Some(selection.clone());
+        drop(state);
+
+        self.render_diff();
+        if !cached {
+            if let Selection::Commit(oid) = selection {
+                self.load_commit_diff(generation, oid);
+            }
+        }
+    }
+
+    /// Rebuilds the Changes sidebar.
+    fn render_changes(&self) {
+        let (data, selection) = {
+            let state = self.state.borrow();
+            let Some(data) = state.data.as_ref() else {
+                return;
+            };
+            (data.status.clone(), state.selection.clone())
+        };
+        self.changes.update(&data, selection.as_ref());
+    }
+
+    /// Rebuilds the History sidebar.
+    fn render_history(&self) {
+        let (commits, selection, loading, exhausted) = {
+            let state = self.state.borrow();
+            (
+                state.commits.clone(),
+                state.selection.clone(),
+                state.history_loading,
+                state.history_exhausted,
+            )
+        };
+        self.history_view
+            .update(&commits, selection.as_ref(), loading, exhausted);
     }
 
     /// Rebuilds the diff pane for the current selection.
-    fn render_diff(&self, data: &RefreshData, selection: Option<&Selection>) {
+    fn render_diff(&self) {
+        let state = self.state.borrow();
         while let Some(child) = self.diff_box.first_child() {
             self.diff_box.remove(&child);
         }
 
-        let widget = match selection {
+        let widget = match &state.selection {
             None => diff_view::placeholder("Select a file to see its diff"),
             Some(Selection::Untracked(path)) => {
                 diff_view::render_untracked(path, &self.diff_callbacks())
             }
-            Some(Selection::Staged(path)) => {
-                self.render_file_diff(&data.staged, path, DiffSide::Staged)
-            }
-            Some(Selection::Unstaged(path)) => {
-                self.render_file_diff(&data.worktree, path, DiffSide::Unstaged)
-            }
+            Some(Selection::Staged(path)) => match state.data.as_ref() {
+                Some(data) => self.render_file_diff(&data.staged, path, DiffSide::Staged),
+                None => diff_view::placeholder("Loading…"),
+            },
+            Some(Selection::Unstaged(path)) => match state.data.as_ref() {
+                Some(data) => self.render_file_diff(&data.worktree, path, DiffSide::Unstaged),
+                None => diff_view::placeholder("Loading…"),
+            },
+            Some(Selection::Commit(oid)) => match &state.commit_diff {
+                Some((cached, diff)) if cached == oid => self.render_commit_diff(diff),
+                _ => diff_view::placeholder("Loading diff…"),
+            },
         };
         self.diff_box.append(&widget);
         self.diff_scroll.vadjustment().set_value(0.0);
@@ -273,6 +469,22 @@ impl Inner {
             Some(file) => diff_view::render(file, side, &self.diff_callbacks()),
             None => diff_view::placeholder("No diff available for this file"),
         }
+    }
+
+    /// Renders every file of a commit diff with the same renderer (SPEC §17).
+    fn render_commit_diff(&self, diff: &Diff) -> gtk4::Widget {
+        if diff.files.is_empty() {
+            return diff_view::placeholder("No changes in this commit");
+        }
+        let box_ = GtkBox::new(Orientation::Vertical, 24);
+        for file in &diff.files {
+            box_.append(&diff_view::render(
+                file,
+                DiffSide::History,
+                &self.diff_callbacks(),
+            ));
+        }
+        box_.upcast()
     }
 
     fn diff_callbacks(&self) -> Rc<diff_view::Callbacks> {
@@ -422,6 +634,27 @@ impl Inner {
     }
 }
 
+/// Requests more history when the sidebar is scrolled near its bottom.
+fn hook_history_scroll(adjustment: &Adjustment, weak: Weak<Inner>) {
+    let check: Rc<dyn Fn(&Adjustment)> = Rc::new(move |adjustment| {
+        let near_bottom = adjustment.upper() - (adjustment.value() + adjustment.page_size())
+            < HISTORY_SCROLL_THRESHOLD;
+        if near_bottom {
+            if let Some(inner) = weak.upgrade() {
+                inner.request_history_more();
+            }
+        }
+    });
+    {
+        let check = check.clone();
+        adjustment.connect_value_changed(move |adjustment| check(adjustment));
+    }
+    {
+        let check = check.clone();
+        adjustment.connect_upper_notify(move |adjustment| check(adjustment));
+    }
+}
+
 /// Builds a single-argument operation callback bound to `weak`.
 fn op_callback<T: 'static>(weak: &Weak<Inner>, op: fn(&Inner, T)) -> Box<dyn Fn(T)> {
     let weak = weak.clone();
@@ -451,6 +684,8 @@ fn selection_exists(status: &Status, selection: &Selection) -> bool {
         Selection::Staged(path) => status.staged_entries().any(|entry| entry.path == *path),
         Selection::Unstaged(path) => status.unstaged_entries().any(|entry| entry.path == *path),
         Selection::Untracked(path) => status.untracked_entries().any(|entry| entry.path == *path),
+        // Commits are immutable: a selected commit stays valid across refreshes.
+        Selection::Commit(_) => true,
     }
 }
 
@@ -481,7 +716,7 @@ fn find_file<'a>(diff: &'a Diff, path: &Path) -> Option<&'a FileDiff> {
         .find(|file| file.path() == Some(path) || file.old_path.as_deref() == Some(path))
 }
 
-fn subtitle_text(repo: &Repository, status: &Status) -> String {
+fn subtitle_text(root: &Path, status: &Status) -> String {
     use crate::model::status::Head;
     let branch = match &status.branch.head {
         Head::Branch(name) => name.clone(),
@@ -489,9 +724,9 @@ fn subtitle_text(repo: &Repository, status: &Status) -> String {
         Head::Unknown => String::new(),
     };
     if branch.is_empty() {
-        short_path(repo.root())
+        short_path(root)
     } else {
-        format!("{} — {}", short_path(repo.root()), branch)
+        format!("{} — {}", short_path(root), branch)
     }
 }
 

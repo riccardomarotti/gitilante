@@ -128,6 +128,8 @@ fn file_header(file: &FileDiff, side: DiffSide, callbacks: &Rc<Callbacks>) -> gt
                 move || (callbacks.discard_file)(path.clone())
             }));
         }
+        // Historical commits get their actions in Fase 6 (Revert hunk).
+        DiffSide::History => {}
     }
     header.upcast()
 }
@@ -174,6 +176,7 @@ fn hunk_view(
                 move || (callbacks.discard_hunk)(file.clone(), hunk.clone())
             }));
         }
+        DiffSide::History => {}
     }
     block.append(&header);
     block.append(&hunk_body(hunk));

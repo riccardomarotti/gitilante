@@ -10,13 +10,11 @@ use crate::git::repository::Repository;
 use crate::model::diff::{Diff, DiffLine, DiffLineKind, FileDiff, FileStatus, Hunk};
 use std::path::PathBuf;
 
-/// Arguments shared by every machine-readable diff: neutralize colors,
-/// external diff drivers and textconv, pin the `a/`-`b/` path prefixes and
-/// force C-style path quoting so pathnames stay parseable line by line.
-const STABLE_DIFF_ARGS: &[&str] = &[
-    "-c",
-    "core.quotePath=true",
-    "diff",
+/// Flags that pin the diff output format, shared by `git diff` and `git show`:
+/// neutralize colors, external diff drivers and textconv, pin the `a/`-`b/`
+/// path prefixes and force C-style path quoting so pathnames stay parseable
+/// line by line.
+pub const STABLE_DIFF_FLAGS: &[&str] = &[
     "--no-color",
     "--no-ext-diff",
     "--no-textconv",
@@ -28,15 +26,22 @@ const STABLE_DIFF_ARGS: &[&str] = &[
 /// Result of the output parsers, failing with a human-readable detail.
 type ParseResult<T> = std::result::Result<T, String>;
 
+/// Arguments of `git diff` with the pinned output format.
+fn diff_args() -> Vec<&'static str> {
+    let mut args = vec!["-c", "core.quotePath=true", "diff"];
+    args.extend_from_slice(STABLE_DIFF_FLAGS);
+    args
+}
+
 /// Diff of the working tree against the index (unstaged changes).
 pub fn working_tree_diff(repo: &Repository) -> Result<Diff> {
-    let output = command::run(repo.root(), STABLE_DIFF_ARGS)?;
+    let output = command::run(repo.root(), &diff_args())?;
     parse_or_error(&output.stdout)
 }
 
 /// Diff of the index against HEAD (staged changes).
 pub fn staged_diff(repo: &Repository) -> Result<Diff> {
-    let mut args = STABLE_DIFF_ARGS.to_vec();
+    let mut args = diff_args();
     args.push("--cached");
     let output = command::run(repo.root(), &args)?;
     parse_or_error(&output.stdout)

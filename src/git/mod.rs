@@ -6,6 +6,7 @@
 pub mod command;
 pub mod diff;
 pub mod error;
+pub mod history;
 pub mod patch;
 pub mod repository;
 pub mod status;
