@@ -1,16 +1,16 @@
 //! `gitilante` command line entry point.
 //!
 //! Usage: `gitilante [path]` opens the repository containing `path` (default:
-//! the current directory). Until the GTK UI lands (Fase 4) this binary only
-//! resolves the repository and prints its status.
+//! the current directory) in the GUI.
 
 use std::env;
 use std::ffi::OsString;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use gitilante::git::{Error, Repository};
-use gitilante::model::status::{Status, StatusEntry};
+use gitilante::git::Error;
+use gitilante::git::repository::Repository;
+use gitilante::ui;
 
 const USAGE: &str = "\
 Usage: gitilante [path]
@@ -21,6 +21,10 @@ When <path> is omitted, the current directory is used.
 Options:
   -h, --help     Show this help
   -V, --version  Show the version
+
+Shortcuts:
+  Ctrl+R         Refresh
+  Ctrl+Q         Quit
 ";
 
 /// What the command line asked for.
@@ -54,14 +58,7 @@ fn main() -> ExitCode {
         Err(error) => return report(&error),
     };
 
-    match repo.status() {
-        Ok(status) => {
-            println!("Repository: {}", repo.root().display());
-            print_status(&status);
-            ExitCode::SUCCESS
-        }
-        Err(error) => report(&error),
-    }
+    ExitCode::from(ui::app::run(repo) as u8)
 }
 
 /// Parses the command line.
@@ -91,35 +88,6 @@ fn parse_args<I: IntoIterator<Item = OsString>>(args: I) -> Result<Args, String>
         0 => Ok(Args::Open(PathBuf::from("."))),
         1 => Ok(Args::Open(PathBuf::from(&positional[0]))),
         _ => Err("too many paths given".to_owned()),
-    }
-}
-
-/// Prints a status summary (temporary scaffolding until the GTK UI lands).
-fn print_status(status: &Status) {
-    let head = match &status.branch.head {
-        gitilante::model::status::Head::Branch(name) => name.clone(),
-        gitilante::model::status::Head::Detached => "(detached)".to_owned(),
-        gitilante::model::status::Head::Unknown => "(unknown)".to_owned(),
-    };
-    println!("Branch: {head}");
-
-    print_entries("Staged:", status.staged_entries().collect());
-    print_entries("Unstaged:", status.unstaged_entries().collect());
-    print_entries("Untracked:", status.untracked_entries().collect());
-}
-
-fn print_entries(title: &str, entries: Vec<&StatusEntry>) {
-    if entries.is_empty() {
-        return;
-    }
-    println!("{title}");
-    for entry in entries {
-        let orig = entry
-            .orig_path
-            .as_ref()
-            .map(|path| format!(" (from {})", path.display()))
-            .unwrap_or_default();
-        println!("  {}{}", entry.path.display(), orig);
     }
 }
 
