@@ -65,6 +65,8 @@ struct Inner {
     state: RefCell<State>,
     /// In-flight requests, shown by the header bar spinner.
     busy: Cell<u32>,
+    /// Shared syntax highlighting resources (COLORS.md section 49).
+    highlighter: crate::syntax::Highlighter,
     self_weak: Weak<Inner>,
     window: adw::ApplicationWindow,
     toast_overlay: adw::ToastOverlay,
@@ -237,11 +239,23 @@ impl Inner {
             });
         }
 
+        // Re-render the diff when the light/dark appearance changes, so the
+        // syntax style scheme follows the theme (COLORS.md sections 17, 32).
+        {
+            let weak = self_weak.clone();
+            adw::StyleManager::default().connect_dark_notify(move |_| {
+                if let Some(inner) = weak.upgrade() {
+                    inner.render_diff();
+                }
+            });
+        }
+
         Self {
             repo,
             worker: Worker::new(),
             state: RefCell::new(State::default()),
             busy: Cell::new(0),
+            highlighter: crate::syntax::Highlighter::new(),
             self_weak,
             window,
             toast_overlay,
@@ -525,7 +539,7 @@ impl Inner {
 
     fn render_file_diff(&self, diff: &Diff, path: &Path, side: DiffSide) -> gtk4::Widget {
         match find_file(diff, path) {
-            Some(file) => diff_view::render(file, side, &self.diff_callbacks()),
+            Some(file) => diff_view::render(file, side, &self.highlighter, &self.diff_callbacks()),
             None => diff_view::placeholder("No diff available for this file"),
         }
     }
@@ -540,6 +554,7 @@ impl Inner {
             box_.append(&diff_view::render(
                 file,
                 DiffSide::History,
+                &self.highlighter,
                 &self.diff_callbacks(),
             ));
         }

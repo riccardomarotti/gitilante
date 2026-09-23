@@ -11,7 +11,12 @@ use std::rc::Rc;
 use gtk4::gdk;
 use gtk4::pango;
 use gtk4::prelude::*;
-use gtk4::{Align, Box as GtkBox, Button, Label, Orientation, TextBuffer, TextView, WrapMode};
+use gtk4::{
+    Align, Box as GtkBox, Button, Label, Orientation, TextBuffer, TextTag, TextView, WrapMode,
+};
+use sourceview5::Language;
+
+use crate::syntax::Highlighter;
 
 use crate::model::diff::{DiffLineKind, FileDiff, Hunk};
 use crate::ui::{DiffSide, HunkTarget, display_name};
@@ -39,10 +44,22 @@ pub struct Callbacks {
 }
 
 /// Renders the diff of `file` with the per-hunk and per-file actions of `side`.
-pub fn render(file: &FileDiff, side: DiffSide, callbacks: &Rc<Callbacks>) -> gtk4::Widget {
+pub fn render(
+    file: &FileDiff,
+    side: DiffSide,
+    highlighter: &Highlighter,
+    callbacks: &Rc<Callbacks>,
+) -> gtk4::Widget {
     let root = GtkBox::new(Orientation::Vertical, 12);
     set_margins(&root, 12);
     root.append(&file_header(file, side, callbacks));
+
+    // One language per file: prefer the new path of a rename (COLORS.md §8).
+    let language = file
+        .new_path
+        .as_deref()
+        .or(file.old_path.as_deref())
+        .and_then(crate::syntax::detect_language);
 
     if file.binary {
         // SPEC section 23: binary files have no textual hunks.
@@ -56,7 +73,14 @@ pub fn render(file: &FileDiff, side: DiffSide, callbacks: &Rc<Callbacks>) -> gtk
         }
     } else {
         for hunk in &file.hunks {
-            root.append(&hunk_view(file, hunk, side, callbacks));
+            root.append(&hunk_view(
+                file,
+                hunk,
+                side,
+                language.as_ref(),
+                highlighter,
+                callbacks,
+            ));
         }
     }
     root.upcast()
@@ -144,6 +168,8 @@ fn hunk_view(
     file: &FileDiff,
     hunk: &Hunk,
     side: DiffSide,
+    language: Option<&Language>,
+    highlighter: &Highlighter,
     callbacks: &Rc<Callbacks>,
 ) -> gtk4::Widget {
     let block = GtkBox::new(Orientation::Vertical, 4);
@@ -228,7 +254,7 @@ fn hunk_view(
     }
     block.append(&header);
 
-    let body = hunk_body(hunk);
+    let body = hunk_body(hunk, language, highlighter);
     track_focus(&body, &target, callbacks);
     block.append(&body);
     block.upcast()
@@ -259,70 +285,181 @@ fn track_focus(widget: &impl IsA<gtk4::Widget>, target: &HunkTarget, callbacks: 
     widget.add_controller(controller);
 }
 
-/// Monospace text view with the hunk lines and their line numbers.
-fn hunk_body(hunk: &Hunk) -> gtk4::Widget {
-    let view = TextView::new();
-    view.set_editable(false);
-    view.set_cursor_visible(false);
-    view.set_monospace(true);
-    view.set_wrap_mode(WrapMode::None);
-    view.set_left_margin(8);
-    view.set_right_margin(8);
-    view.set_top_margin(4);
-    view.set_bottom_margin(4);
-    view.add_css_class("frame");
+/// Which logical source stream styles a visible line (COLORS.md §11).
+#[derive(Debug, Clone, Copy)]
+enum Side {
+    /// The old (removed) side of a change block.
+    Old,
+    /// The new (added) side of a change block.
+    New,
+}
 
-    let buffer: TextBuffer = view.buffer();
-    let add_tag = new_tag(&buffer, "add", addition_background());
-    let del_tag = new_tag(&buffer, "del", deletion_background());
+/// Hunk body: the diff gutter beside the clean source text.
+///
+/// The visible buffer only contains the source text (COLORS.md sections 5 and
+/// 19), so copying always yields the file content: line numbers and diff
+/// markers live in the unselectable gutter. The three visual levels compose
+/// (COLORS.md section 28 and DIFF.md section 25): syntax tags carry the
+/// foreground, the line tags the base background and the intraline tags the
+/// strong background on top. Styles come from the two logical streams of the
+/// hunk, never from the mixed text (COLORS.md sections 11 and 12).
+fn hunk_body(hunk: &Hunk, language: Option<&Language>, highlighter: &Highlighter) -> gtk4::Widget {
+    // Build the old and new source streams and remember, for every visible
+    // line, which stream styles it (context lines are shared, section 20).
+    let (mut old_lines, mut new_lines) = (Vec::<String>::new(), Vec::<String>::new());
+    let mut sources: Vec<Option<(Side, usize)>> = Vec::with_capacity(hunk.lines.len());
+    for line in &hunk.lines {
+        let text = line.text().into_owned();
+        match line.kind {
+            DiffLineKind::Deletion => {
+                sources.push(Some((Side::Old, old_lines.len())));
+                old_lines.push(text);
+            }
+            DiffLineKind::Addition => {
+                sources.push(Some((Side::New, new_lines.len())));
+                new_lines.push(text);
+            }
+            DiffLineKind::Context => {
+                sources.push(Some((Side::New, new_lines.len())));
+                old_lines.push(text.clone());
+                new_lines.push(text);
+            }
+            DiffLineKind::NoNewlineMarker => sources.push(None),
+        }
+    }
+
+    let scheme = crate::syntax::style_scheme();
+    let old_styles = highlighter.highlight(language, scheme.as_ref(), &old_lines);
+    let new_styles = highlighter.highlight(language, scheme.as_ref(), &new_lines);
+
+    let buffer = TextBuffer::new(Some(highlighter.table()));
+    let add_tag = new_tag(&buffer, addition_background());
+    let del_tag = new_tag(&buffer, deletion_background());
+    let add_strong = new_tag_strong(&buffer, addition_strong_background());
+    let del_strong = new_tag_strong(&buffer, deletion_strong_background());
     let dim_tag = new_tag_dim(&buffer);
 
+    let mut text = String::new();
+    for line in &hunk.lines {
+        text.push_str(&line.text());
+        text.push('\n');
+    }
+    buffer.insert(&mut buffer.start_iter(), &text);
+
+    for (index, line) in hunk.lines.iter().enumerate() {
+        let row = index as i32;
+        let chars = line.text().chars().count();
+        // Syntax foreground (COLORS.md section 3).
+        if let Some((side, source)) = sources[index] {
+            let styles = match side {
+                Side::Old => &old_styles,
+                Side::New => &new_styles,
+            };
+            for segment in &styles[source] {
+                apply_range(&buffer, row, segment.start, segment.end, &segment.tags);
+            }
+        }
+        // Line diff background (COLORS.md section 3).
+        let line_tag = match line.kind {
+            DiffLineKind::Addition => Some(&add_tag),
+            DiffLineKind::Deletion => Some(&del_tag),
+            _ => None,
+        };
+        if let Some(tag) = line_tag {
+            apply_range(&buffer, row, 0, chars, std::slice::from_ref(tag));
+        }
+        // Strong intraline background (DIFF.md section 25).
+        let strong = match line.kind {
+            DiffLineKind::Addition => Some(&add_strong),
+            DiffLineKind::Deletion => Some(&del_strong),
+            _ => None,
+        };
+        if let Some(tag) = strong {
+            for span in &line.intraline {
+                apply_range(
+                    &buffer,
+                    row,
+                    span.start,
+                    span.end,
+                    std::slice::from_ref(tag),
+                );
+            }
+        }
+        if line.kind == DiffLineKind::NoNewlineMarker {
+            apply_range(&buffer, row, 0, chars, std::slice::from_ref(&dim_tag));
+        }
+    }
+
+    let body = TextView::with_buffer(&buffer);
+    body.set_editable(false);
+    body.set_cursor_visible(false);
+    body.set_monospace(true);
+    body.set_wrap_mode(WrapMode::None);
+    body.set_left_margin(4);
+    body.set_right_margin(8);
+    body.set_top_margin(4);
+    body.set_bottom_margin(4);
+    body.set_hexpand(true);
+
+    // Diff gutter: numbers and markers, never part of the source text and
+    // never selectable (COLORS.md sections 5, 6 and 19).
+    let mut gutter = String::new();
     let width = line_number_width(hunk);
     let mut old_num = hunk.old_start;
     let mut new_num = hunk.new_start;
-    let mut iter = buffer.start_iter();
-
     for line in &hunk.lines {
-        match line.kind {
-            DiffLineKind::NoNewlineMarker => {
-                let text = format!("{} │ \\{}", " ".repeat(width), line.text().trim_start());
-                buffer.insert_with_tags(&mut iter, &text, &[&dim_tag]);
+        let cell = match line.kind {
+            DiffLineKind::NoNewlineMarker => format!("  {:>width$} │", ""),
+            DiffLineKind::Addition => {
+                let number = new_num;
+                new_num += 1;
+                format!("+ {number:>width$} │")
             }
-            kind => {
-                let (marker, number) = match kind {
-                    DiffLineKind::Addition => {
-                        let number = new_num;
-                        new_num += 1;
-                        ('+', number)
-                    }
-                    DiffLineKind::Deletion => {
-                        let number = old_num;
-                        old_num += 1;
-                        ('-', number)
-                    }
-                    _ => {
-                        let number = new_num;
-                        old_num += 1;
-                        new_num += 1;
-                        (' ', number)
-                    }
-                };
-                let text = format!("{marker} {number:>width$} │ {}", line.text());
-                match kind {
-                    DiffLineKind::Addition => {
-                        buffer.insert_with_tags(&mut iter, &text, &[&add_tag])
-                    }
-                    DiffLineKind::Deletion => {
-                        buffer.insert_with_tags(&mut iter, &text, &[&del_tag])
-                    }
-                    _ => buffer.insert(&mut iter, &text),
-                }
+            DiffLineKind::Deletion => {
+                let number = old_num;
+                old_num += 1;
+                format!("- {number:>width$} │")
             }
-        }
-        buffer.insert(&mut iter, "\n");
+            _ => {
+                let number = new_num;
+                old_num += 1;
+                new_num += 1;
+                format!("  {number:>width$} │")
+            }
+        };
+        gutter.push_str(&cell);
+        gutter.push('\n');
     }
 
-    view.upcast()
+    let gutter_view = Label::new(Some(&gutter));
+    gutter_view.add_css_class("monospace");
+    gutter_view.add_css_class("dim-label");
+    gutter_view.set_xalign(0.0);
+    gutter_view.set_margin_start(8);
+    gutter_view.set_margin_top(4);
+    gutter_view.set_margin_bottom(4);
+
+    let box_ = GtkBox::new(Orientation::Horizontal, 0);
+    box_.add_css_class("frame");
+    box_.append(&gutter_view);
+    box_.append(&body);
+    box_.upcast()
+}
+
+/// Applies `tags` to a character range of one buffer line.
+fn apply_range(buffer: &TextBuffer, line: i32, start: usize, end: usize, tags: &[TextTag]) {
+    if start >= end {
+        return;
+    }
+    let Some(start) = buffer.iter_at_line_offset(line, start as i32) else {
+        return;
+    };
+    let Some(end) = buffer.iter_at_line_offset(line, end as i32) else {
+        return;
+    };
+    for tag in tags {
+        buffer.apply_tag(tag, &start, &end);
+    }
 }
 
 /// Raw extended header lines, shown for diffs without hunks.
@@ -376,19 +513,37 @@ fn addition_background() -> gdk::RGBA {
     gdk::RGBA::new(0.20, 0.60, 0.30, 0.18)
 }
 
+fn addition_strong_background() -> gdk::RGBA {
+    gdk::RGBA::new(0.20, 0.60, 0.30, 0.38)
+}
+
 fn deletion_background() -> gdk::RGBA {
     gdk::RGBA::new(0.85, 0.30, 0.30, 0.18)
 }
 
-fn new_tag(buffer: &TextBuffer, name: &str, background: gdk::RGBA) -> gtk4::TextTag {
+fn deletion_strong_background() -> gdk::RGBA {
+    gdk::RGBA::new(0.85, 0.30, 0.30, 0.38)
+}
+
+/// Diff and dim tags are anonymous: the tag table is shared with the syntax
+/// tags (COLORS.md section 28) and named tags would collide between hunks.
+fn new_tag(buffer: &TextBuffer, background: gdk::RGBA) -> gtk4::TextTag {
     buffer
-        .create_tag(Some(name), &[("paragraph-background-rgba", &background)])
+        .create_tag(None::<&str>, &[("paragraph-background-rgba", &background)])
         .expect("create text tag")
 }
 
 fn new_tag_dim(buffer: &TextBuffer) -> gtk4::TextTag {
     let gray = gdk::RGBA::new(0.5, 0.5, 0.5, 0.8);
     buffer
-        .create_tag(Some("dim"), &[("foreground-rgba", &gray)])
+        .create_tag(None::<&str>, &[("foreground-rgba", &gray)])
+        .expect("create text tag")
+}
+
+/// Overlay tag for the strong intraline spans: the background covers the text
+/// extent only, on top of the line background (COLORS.md section 28).
+fn new_tag_strong(buffer: &TextBuffer, background: gdk::RGBA) -> gtk4::TextTag {
+    buffer
+        .create_tag(None::<&str>, &[("background-rgba", &background)])
         .expect("create text tag")
 }
