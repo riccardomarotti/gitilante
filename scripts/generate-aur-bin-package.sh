@@ -4,12 +4,13 @@
 # package gitilante-bin (BINPACKAGE.md sections 18-19).
 #
 # Usage:
-#   scripts/generate-aur-bin-package.sh <version> --archive <tarball> \
+#   scripts/generate-aur-bin-package.sh <version> [--archive <tarball>] \
 #       [--url <binary-url>] [--pkgrel <n>]
 #
 # Arguments:
 #   <version>      release version, with or without the leading "v" (e.g. 0.3.0)
 #   --archive      the binary bundle archive used to compute the real SHA-256
+#                  (default: dist/bin/gitilante-<version>-linux-x86_64.tar.gz)
 #   --url <url>    download URL of the bundle (default: the GitLab Generic
 #                  Package Registry URL of this release)
 #   --pkgrel <n>   package release number (default: 1; bump on packaging-only
@@ -29,13 +30,14 @@ die() { printf 'error: %s\n' "$*" >&2; exit 1; }
 
 usage() {
     cat <<'EOF'
-Usage: scripts/generate-aur-bin-package.sh <version> --archive <tarball> [--url <binary-url>] [--pkgrel <n>]
+Usage: scripts/generate-aur-bin-package.sh <version> [--archive <tarball>] [--url <binary-url>] [--pkgrel <n>]
 
 Generates dist/aur-bin/PKGBUILD and dist/aur-bin/.SRCINFO for a release.
 
 Arguments:
   <version>      release version, with or without the leading "v" (e.g. 0.3.0)
   --archive      the binary bundle archive used to compute the real SHA-256
+                 (default: dist/bin/gitilante-<version>-linux-x86_64.tar.gz)
   --url <url>    download URL of the bundle (default: the GitLab Generic
                  Package Registry URL of this release)
   --pkgrel <n>   package release number (default: 1)
@@ -83,7 +85,7 @@ done
 VERSION="${VERSION#v}"
 [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "invalid version: $VERSION (expected MAJOR.MINOR.PATCH)"
 [[ "$PKGREL" =~ ^[0-9]+$ ]] || die "invalid package release: $PKGREL (expected a number)"
-[ -n "$ARCHIVE" ] || die "--archive is required"
+ARCHIVE="${ARCHIVE:-dist/bin/gitilante-$VERSION-linux-x86_64.tar.gz}"
 [ -f "$ARCHIVE" ] || die "missing archive: $ARCHIVE"
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
