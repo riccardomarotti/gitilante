@@ -4,5 +4,6 @@
 //! that every Git operation stays testable without GTK.
 
 pub mod git;
+pub mod intraline;
 pub mod model;
 pub mod ui;
