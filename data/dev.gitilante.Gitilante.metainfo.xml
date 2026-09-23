@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>dev.gitilante.Gitilante</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>GPL-3.0-or-later</project_license>
+  <name>Gitilante</name>
+  <summary>Review Git changes and manipulate single hunks</summary>
+  <description>
+    <p>
+      Gitilante is a lightweight Git GUI focused on the operations that are
+      more convenient graphically than in a terminal: reviewing the current
+      changes and staging, unstaging, discarding or reverting single hunks,
+      with a fast view of the history.
+    </p>
+    <p>
+      It is a thin frontend over the git executable and deliberately does not
+      replace the command line: commits, branches, merges and everything else
+      stay in your terminal workflow.
+    </p>
+  </description>
+  <launchable type="desktop-id">dev.gitilante.Gitilante.desktop</launchable>
+  <url type="homepage">https://gitlab.com/rutilante/gitilante</url>
+  <url type="bugtracker">https://gitlab.com/rutilante/gitilante/-/issues</url>
+  <developer id="dev.gitilante">
+    <name>Riccardo Marotti</name>
+  </developer>
+  <content_rating type="oars-1.1"/>
+  <provides>
+    <binary>gitilante</binary>
+  </provides>
+  <releases>
+    <release version="0.1.0" date="2026-09-23"/>
+  </releases>
+</component>

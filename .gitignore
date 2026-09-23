@@ -1,3 +1,5 @@
 /target
 SPEC.md
 ACCEPTANCE.md
+DEPLOY.md
+/dist/

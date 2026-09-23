@@ -75,5 +75,11 @@ The acceptance criteria (SPEC.md, section 34) are tracked in
 
 ## Packaging
 
-An Arch Linux `PKGBUILD` is provided in `packaging/arch/`; see the comment at
-the top of the file for how to build a package from this tree.
+Release packaging lives in `packaging/aur/` (a `PKGBUILD` template) and
+`scripts/`. To generate the AUR package metadata locally:
+
+```bash
+./scripts/generate-aur-package.sh 0.1.0        # from the GitLab tag archive
+./scripts/generate-aur-package.sh 0.1.0 --local  # testing only, pre-tag
+cd dist/aur && makepkg
+```
