@@ -10,25 +10,9 @@ use std::ffi::OsString;
 use std::os::unix::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
 
-use common::TestRepo;
+use common::{TestRepo, file, numbered_lines};
 use gitilante::git::patch::single_hunk_patch;
-use gitilante::model::diff::{Diff, DiffLineKind, FileDiff, FileStatus};
-
-/// Finds a file diff by path, panicking when it is missing.
-fn file<'a>(diff: &'a Diff, name: &str) -> &'a FileDiff {
-    diff.files
-        .iter()
-        .find(|file| file.path() == Some(Path::new(name)))
-        .unwrap_or_else(|| panic!("no file diff for {name:?}, got {:#?}", diff.files))
-}
-
-/// Builds a file with `count` numbered lines.
-fn numbered_lines(count: usize) -> Vec<u8> {
-    (1..=count)
-        .map(|number| format!("line{number}\n"))
-        .collect::<String>()
-        .into_bytes()
-}
+use gitilante::model::diff::{DiffLineKind, FileStatus};
 
 #[test]
 fn empty_diff_for_a_clean_worktree() {

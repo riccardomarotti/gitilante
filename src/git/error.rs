@@ -48,6 +48,9 @@ pub enum Error {
     Io { command: String, source: io::Error },
     /// The given path does not belong to a Git repository.
     NotARepository { path: PathBuf },
+    /// A patch (or its reverse) no longer applies cleanly: the repository
+    /// changed after the diff it was built from was read.
+    PatchDoesNotApply { stderr: String },
     /// `git` produced output that could not be parsed.
     MalformedOutput { command: String, detail: String },
 }
@@ -60,6 +63,12 @@ impl fmt::Display for Error {
                 write!(f, "Could not run Git.\n\n{command}\n\n{source}")
             }
             Self::NotARepository { path } => write!(f, "Not a Git repository: {}", path.display()),
+            Self::PatchDoesNotApply { stderr } => {
+                write!(
+                    f,
+                    "This hunk can no longer be applied because the file has changed.\n\n{stderr}"
+                )
+            }
             Self::MalformedOutput { command, detail } => {
                 write!(f, "Unexpected output from `git {command}`.\n\n{detail}")
             }

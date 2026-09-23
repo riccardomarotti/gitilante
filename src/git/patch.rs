@@ -1,9 +1,56 @@
-//! Patch reconstruction.
+//! Patch reconstruction and application.
 //!
 //! Turns parts of a parsed diff back into unified diff text that `git apply`
-//! accepts. Used to stage, unstage, discard and revert single hunks.
+//! accepts, and applies patches with a mandatory dry run first: a patch built
+//! from an outdated diff must never modify the repository.
 
+use std::path::Path;
+
+use crate::git::Result;
+use crate::git::command;
+use crate::git::error::Error;
 use crate::model::diff::{DiffLineKind, FileDiff, Hunk};
+
+/// What a patch is applied to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApplyTarget {
+    /// The index only (`git apply --cached`), leaving the working tree untouched.
+    Index,
+    /// The working tree (`git apply`), leaving the index untouched.
+    WorkTree,
+}
+
+/// Checks that `patch` applies cleanly, then applies it.
+///
+/// The check is a dry run (`git apply --check`): if it fails the repository is
+/// left untouched and [`Error::PatchDoesNotApply`] is returned. `reverse`
+/// applies the patch backwards, undoing the change it describes.
+pub fn apply(root: &Path, patch: &[u8], target: ApplyTarget, reverse: bool) -> Result<()> {
+    let mut args = vec!["apply"];
+    if target == ApplyTarget::Index {
+        args.push("--cached");
+    }
+    if reverse {
+        args.push("--reverse");
+    }
+
+    // Dry run first: never modify anything on a stale or conflicting patch.
+    let mut check_args = args.clone();
+    check_args.extend(["--check", "-"]);
+    match command::run_with_stdin(root, &check_args, Some(patch)) {
+        Ok(_) => {}
+        Err(Error::Git(git_error)) => {
+            return Err(Error::PatchDoesNotApply {
+                stderr: git_error.stderr,
+            });
+        }
+        Err(error) => return Err(error),
+    }
+
+    args.push("-");
+    command::run_with_stdin(root, &args, Some(patch))?;
+    Ok(())
+}
 
 /// Rebuilds a minimal valid patch containing only `hunk` of `file`.
 ///

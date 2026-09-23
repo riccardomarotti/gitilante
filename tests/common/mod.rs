@@ -10,7 +10,25 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use gitilante::model::diff::{Diff, FileDiff};
+
 static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Finds a file diff by path, panicking when it is missing.
+pub fn file<'a>(diff: &'a Diff, name: &str) -> &'a FileDiff {
+    diff.files
+        .iter()
+        .find(|file| file.path() == Some(Path::new(name)))
+        .unwrap_or_else(|| panic!("no file diff for {name:?}, got {:#?}", diff.files))
+}
+
+/// Builds the content of a file with `count` numbered lines (`line1` ...).
+pub fn numbered_lines(count: usize) -> Vec<u8> {
+    (1..=count)
+        .map(|number| format!("line{number}\n"))
+        .collect::<String>()
+        .into_bytes()
+}
 
 /// A temporary Git repository with a hermetic configuration.
 pub struct TestRepo {
@@ -132,6 +150,11 @@ impl TestRepo {
         fs::remove_file(self.root.join(relative)).expect("remove file");
     }
 
+    /// Reads a file from the working tree.
+    pub fn read(&self, relative: impl AsRef<Path>) -> Vec<u8> {
+        fs::read(self.root.join(relative)).expect("read file")
+    }
+
     /// Creates a symbolic link pointing at `target`.
     pub fn symlink(&self, target: impl AsRef<Path>, relative: impl AsRef<Path>) {
         std::os::unix::fs::symlink(target, self.root.join(relative)).expect("create symlink");
@@ -163,6 +186,19 @@ impl TestRepo {
     pub fn commit_all(&self, message: &str) {
         self.git(&["add", "-A"]);
         self.git(&["commit", "-q", "-m", message]);
+    }
+
+    /// Finds a status entry by path, panicking when it is missing.
+    pub fn entry<'a>(
+        &self,
+        status: &'a gitilante::model::status::Status,
+        name: &str,
+    ) -> &'a gitilante::model::status::StatusEntry {
+        status
+            .entries
+            .iter()
+            .find(|entry| entry.path == Path::new(name))
+            .unwrap_or_else(|| panic!("no status entry for {name:?}, got {:#?}", status.entries))
     }
 }
 
