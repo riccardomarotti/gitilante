@@ -255,6 +255,7 @@ fn parse_hunk_line(line: &[u8], combined: bool) -> ParseResult<DiffLine> {
             return Ok(DiffLine {
                 kind: DiffLineKind::NoNewlineMarker,
                 content: line[1..].to_vec(),
+                intraline: Vec::new(),
             });
         }
         // Tolerate empty context lines without their marker (some tools emit
@@ -280,6 +281,7 @@ fn parse_hunk_line(line: &[u8], combined: bool) -> ParseResult<DiffLine> {
     Ok(DiffLine {
         kind,
         content: content.to_vec(),
+        intraline: Vec::new(),
     })
 }
 

@@ -29,6 +29,10 @@
 
 use unicode_segmentation::UnicodeSegmentation;
 
+use crate::model::diff::{Diff, DiffLineKind, Hunk};
+
+pub use crate::model::diff::IntralineSpan;
+
 /// Maximum line length (in characters) analyzed for intraline changes.
 pub const MAX_INTRALINE_LINE_LENGTH: usize = 4000;
 
@@ -138,18 +142,6 @@ fn pairable_similarity(old: &str, new: &str) -> Option<f64> {
     }
     let similarity = line_similarity(old, new);
     (similarity >= MIN_PAIR_SIMILARITY).then_some(similarity)
-}
-
-/// A changed part of a line.
-///
-/// Offsets are character offsets (Unicode scalar values) into the line text and
-/// always fall on character boundaries, never inside a grapheme cluster.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct IntralineSpan {
-    /// First changed character, included.
-    pub start: usize,
-    /// Character after the last changed one.
-    pub end: usize,
 }
 
 /// Changed parts of a pair of corresponding lines.
@@ -455,9 +447,99 @@ fn shift(span: IntralineSpan, offset: usize) -> IntralineSpan {
     }
 }
 
+// --- diff model integration (DIFF.md sections 30, 31 and 32) ------------
+
+/// Intraline spans of every line of one change block.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct ChangeBlockIntraline {
+    /// Spans of each removed line, in line order (empty when unpaired).
+    pub removed: Vec<Vec<IntralineSpan>>,
+    /// Spans of each added line, in line order (empty when unpaired).
+    pub added: Vec<Vec<IntralineSpan>>,
+}
+
+/// Analyzes one change block: pairs the removed and added lines and finds
+/// what changed inside each pair (DIFF.md sections 3, 4 and 31).
+///
+/// Unpaired lines get no spans: a wholly new line is simply an added line and
+/// the line diff already covers it (DIFF.md section 4).
+pub fn analyze_change_block(removed: &[&str], added: &[&str]) -> ChangeBlockIntraline {
+    let mut analysis = ChangeBlockIntraline {
+        removed: vec![Vec::new(); removed.len()],
+        added: vec![Vec::new(); added.len()],
+    };
+    for pair in pair_lines(removed, added) {
+        let spans = string_intraline(removed[pair.removed], added[pair.added]);
+        analysis.removed[pair.removed] = spans.old;
+        analysis.added[pair.added] = spans.new;
+    }
+    analysis
+}
+
+/// Fills in the intraline spans of every line of `diff`.
+///
+/// The spans are purely derived visual metadata, computed once when the diff
+/// is loaded: patch reconstruction keeps using only line kinds and contents
+/// (DIFF.md sections 2, 13 and 29). The same analysis covers working tree,
+/// staged and commit diffs (DIFF.md section 30).
+pub fn analyze_diff(diff: &mut Diff) {
+    for file in &mut diff.files {
+        for hunk in &mut file.hunks {
+            analyze_hunk(hunk);
+        }
+    }
+}
+
+/// Fills in the intraline spans of one hunk, analyzing only the contiguous
+/// blocks of removed and added lines (DIFF.md section 3).
+pub fn analyze_hunk(hunk: &mut Hunk) {
+    let mut index = 0;
+    while index < hunk.lines.len() {
+        if hunk.lines[index].kind == DiffLineKind::Context {
+            index += 1;
+            continue;
+        }
+
+        // One change block: a run of removed/added lines. No-newline markers
+        // belong to the line above and do not break the run.
+        let (mut removed, mut added) = (Vec::new(), Vec::new());
+        while index < hunk.lines.len() {
+            match hunk.lines[index].kind {
+                DiffLineKind::Deletion => removed.push(index),
+                DiffLineKind::Addition => added.push(index),
+                DiffLineKind::Context => break,
+                DiffLineKind::NoNewlineMarker => {}
+            }
+            index += 1;
+        }
+        if removed.is_empty() || added.is_empty() {
+            continue;
+        }
+
+        let old_texts: Vec<String> = removed
+            .iter()
+            .map(|&i| hunk.lines[i].text().into_owned())
+            .collect();
+        let new_texts: Vec<String> = added
+            .iter()
+            .map(|&i| hunk.lines[i].text().into_owned())
+            .collect();
+        let old_refs: Vec<&str> = old_texts.iter().map(String::as_str).collect();
+        let new_refs: Vec<&str> = new_texts.iter().map(String::as_str).collect();
+        let analysis = analyze_change_block(&old_refs, &new_refs);
+        for (spans, line) in analysis.removed.into_iter().zip(removed) {
+            hunk.lines[line].intraline = spans;
+        }
+        for (spans, line) in analysis.added.into_iter().zip(added) {
+            hunk.lines[line].intraline = spans;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::diff::DiffLine;
 
     /// Changed texts of one side, for readable expectations.
     fn changed(text: &str, spans: &[IntralineSpan]) -> Vec<String> {
@@ -483,6 +565,72 @@ mod tests {
             .into_iter()
             .map(|pair| (pair.removed, pair.added))
             .collect()
+    }
+
+    #[test]
+    fn change_block_analysis_pairs_and_finds_spans() {
+        // DIFF.md sections 8 and 31.
+        let old = "let timeout = Duration::from_secs(10);";
+        let new = "let timeout = Duration::from_secs(30);";
+        let analysis = analyze_change_block(&[old], &[new]);
+        assert_eq!(changed(old, &analysis.removed[0]), ["10"]);
+        assert_eq!(changed(new, &analysis.added[0]), ["30"]);
+    }
+
+    #[test]
+    fn change_block_analysis_leaves_unpaired_lines_plain() {
+        // DIFF.md section 4: baz() is simply a new line (section 39).
+        let analysis = analyze_change_block(
+            &["foo(\"a\");", "bar(\"b\");"],
+            &["foo(\"x\");", "baz();", "bar(\"y\");"],
+        );
+        assert_eq!(changed("foo(\"x\");", &analysis.added[0]), ["x"]);
+        assert!(analysis.added[1].is_empty());
+        assert_eq!(changed("bar(\"y\");", &analysis.added[2]), ["y"]);
+    }
+
+    #[test]
+    fn change_block_analysis_of_unrelated_lines_has_no_spans() {
+        let analysis =
+            analyze_change_block(&["initialize_database();"], &["return Error::Timeout;"]);
+        assert!(analysis.removed[0].is_empty());
+        assert!(analysis.added[0].is_empty());
+    }
+
+    #[test]
+    fn hunk_analysis_covers_only_changed_blocks() {
+        fn line(kind: DiffLineKind, text: &str) -> DiffLine {
+            DiffLine {
+                kind,
+                content: text.as_bytes().to_vec(),
+                intraline: Vec::new(),
+            }
+        }
+        let mut hunk = Hunk {
+            old_start: 1,
+            old_count: 3,
+            new_start: 1,
+            new_count: 4,
+            header: b"@@ -1,3 +1,4 @@".to_vec(),
+            lines: vec![
+                line(DiffLineKind::Context, "let a = 1;"),
+                line(DiffLineKind::Deletion, "let timeout = 10;"),
+                line(DiffLineKind::Addition, "let timeout = 30;"),
+                line(DiffLineKind::Context, "let b = 2;"),
+                line(DiffLineKind::Addition, "fresh_line();"),
+            ],
+        };
+        analyze_hunk(&mut hunk);
+        assert!(hunk.lines[0].intraline.is_empty());
+        assert_eq!(
+            changed("let timeout = 10;", &hunk.lines[1].intraline),
+            ["10"]
+        );
+        assert_eq!(
+            changed("let timeout = 30;", &hunk.lines[2].intraline),
+            ["30"]
+        );
+        assert!(hunk.lines[4].intraline.is_empty()); // unpaired added line
     }
 
     #[test]

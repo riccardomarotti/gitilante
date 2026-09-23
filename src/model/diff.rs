@@ -98,6 +98,19 @@ impl Hunk {
     }
 }
 
+/// A changed part of a line.
+///
+/// Offsets are character offsets (Unicode scalar values) into the line's
+/// display text and always fall on character boundaries, never inside a
+/// grapheme cluster (DIFF.md sections 13 and 14).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IntralineSpan {
+    /// First changed character, included.
+    pub start: usize,
+    /// Character after the last changed one.
+    pub end: usize,
+}
+
 /// A single line inside a hunk.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DiffLine {
@@ -105,6 +118,10 @@ pub struct DiffLine {
     pub kind: DiffLineKind,
     /// Raw line content without its leading marker byte (`+`, `-`, ` ` or `\`).
     pub content: Vec<u8>,
+    /// Changed parts of this line, for the renderer (DIFF.md sections 13
+    /// and 32): purely derived visual metadata, computed once when the diff
+    /// is loaded and never used to rebuild patches.
+    pub intraline: Vec<IntralineSpan>,
 }
 
 impl DiffLine {

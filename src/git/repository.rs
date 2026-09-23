@@ -12,6 +12,15 @@ use crate::model::commit::Commit;
 use crate::model::diff::{Diff, FileDiff, Hunk};
 use crate::model::status::{Status, StatusEntry};
 
+/// Adds the purely derived visual metadata (intraline spans) to a freshly
+/// loaded diff (DIFF.md sections 30 and 32).
+fn enrich(mut diff: Result<Diff>) -> Result<Diff> {
+    if let Ok(value) = &mut diff {
+        crate::intraline::analyze_diff(value);
+    }
+    diff
+}
+
 /// A Git repository, rooted at its working tree root.
 ///
 /// All operations run `git -C <root>`; the process working directory is never
@@ -69,12 +78,12 @@ impl Repository {
 
     /// Diff of the working tree against the index (unstaged changes).
     pub fn working_tree_diff(&self) -> Result<Diff> {
-        crate::git::diff::working_tree_diff(self)
+        enrich(crate::git::diff::working_tree_diff(self))
     }
 
     /// Diff of the index against HEAD (staged changes).
     pub fn staged_diff(&self) -> Result<Diff> {
-        crate::git::diff::staged_diff(self)
+        enrich(crate::git::diff::staged_diff(self))
     }
 
     /// Loads up to `max_count` commits of HEAD starting at `skip` (SPEC §16).
@@ -84,7 +93,7 @@ impl Repository {
 
     /// Diff of a single commit (SPEC §17).
     pub fn commit_diff(&self, oid: &str) -> Result<Diff> {
-        crate::git::history::commit_diff(self, oid)
+        enrich(crate::git::history::commit_diff(self, oid))
     }
 
     /// Stages a single hunk of a working tree diff into the index (SPEC §12).
