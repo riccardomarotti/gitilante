@@ -43,6 +43,10 @@ pub const MAX_REFINE_UNITS: usize = 256;
 const REFINE_COMMON_NUMERATOR: usize = 3;
 const REFINE_COMMON_DENOMINATOR: usize = 4;
 
+/// Minimum similarity for two change block lines to be paired (DIFF.md
+/// sections 6 and 39): better no pairing than a wrong one.
+pub const MIN_PAIR_SIMILARITY: f64 = 0.5;
+
 /// A changed part of a line.
 ///
 /// Offsets are character offsets (Unicode scalar values) into the line text and
@@ -149,6 +153,32 @@ pub fn string_intraline(old: &str, new: &str) -> IntralineSpans {
 struct ChangeBlock {
     old: Vec<usize>,
     new: Vec<usize>,
+}
+
+/// How similar two lines are, from `0.0` (unrelated) to `1.0` (identical).
+///
+/// Used to decide which removed line pairs with which added line (DIFF.md
+/// sections 4 and 5): a Sørensen-Dice similarity over the common tokens found
+/// by the same alignment used for the intraline analysis. Lines that only
+/// differ in one word score high, unrelated code lines score low.
+pub fn line_similarity(old: &str, new: &str) -> f64 {
+    if old == new {
+        return 1.0;
+    }
+    let old_tokens = tokenize(old);
+    let new_tokens = tokenize(new);
+    if old_tokens.is_empty() && new_tokens.is_empty() {
+        return 1.0;
+    }
+    if old_tokens.is_empty() || new_tokens.is_empty() {
+        return 0.0;
+    }
+
+    let blocks = change_blocks(&old_tokens, &new_tokens, |a, b| a.text == b.text);
+    let changed_old: usize = blocks.iter().map(|block| block.old.len()).sum();
+    let changed_new: usize = blocks.iter().map(|block| block.new.len()).sum();
+    let common = (old_tokens.len() + new_tokens.len() - changed_old - changed_new) / 2;
+    2.0 * common as f64 / (old_tokens.len() + new_tokens.len()) as f64
 }
 
 /// Aligns two unit sequences and returns the changed blocks in order.
@@ -404,6 +434,48 @@ mod tests {
                 vec!["true".to_owned(), "100".to_owned()]
             )
         );
+    }
+
+    #[test]
+    fn identical_lines_are_totally_similar() {
+        assert_eq!(line_similarity("let x = 1;", "let x = 1;"), 1.0);
+    }
+
+    #[test]
+    fn small_changes_stay_similar() {
+        // DIFF.md section 4: these are the same line modified.
+        assert!(line_similarity("foo(\"alpha\");", "foo(\"alphas\");") > MIN_PAIR_SIMILARITY);
+        assert!(line_similarity("bar(\"beta\");", "bar(\"gamma\");") > MIN_PAIR_SIMILARITY);
+        assert!(
+            line_similarity(
+                "let timeout = Duration::from_secs(10);",
+                "let timeout = Duration::from_secs(30);"
+            ) > MIN_PAIR_SIMILARITY
+        );
+    }
+
+    #[test]
+    fn unrelated_lines_stay_below_the_threshold() {
+        // DIFF.md section 6: these are not the same line modified.
+        assert!(
+            line_similarity(
+                "initialize_database_connection();",
+                "return Error::InvalidConfiguration;"
+            ) < MIN_PAIR_SIMILARITY
+        );
+        assert!(
+            line_similarity(
+                "println!(\"starting server\");",
+                "return Err(ConfigError::MissingPort);"
+            ) < MIN_PAIR_SIMILARITY
+        );
+    }
+
+    #[test]
+    fn empty_and_whitespace_sides() {
+        assert_eq!(line_similarity("", ""), 1.0);
+        assert_eq!(line_similarity("", "content"), 0.0);
+        assert!(line_similarity("foo = bar;", "foo  = bar;") > MIN_PAIR_SIMILARITY);
     }
 
     #[test]
