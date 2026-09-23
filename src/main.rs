@@ -22,6 +22,8 @@ Options:
   -h, --help     Show this help
   -V, --version  Show the version
 
+The Arch package also installs the short name `gila`.
+
 Shortcuts:
   Ctrl+R         Refresh
   Ctrl+Q         Quit
