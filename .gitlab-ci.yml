@@ -64,13 +64,13 @@ package:
   needs: [check-version, test, build]
   script:
     - echo "Generating PKGBUILD..."
-    - scripts/generate-aur-package.sh "${CI_COMMIT_TAG#v}" --pkgrel 1
     - echo "Generating .SRCINFO..."
     - echo "Testing Arch package..."
-    # makepkg refuses to run as root.
+    # makepkg (including --printsrcinfo) refuses to run as root: generate the
+    # metadata and build the package as an unprivileged user.
     - useradd -m builder
-    - chown -R builder:builder dist
-    - su builder -c "cd dist/aur && makepkg --noconfirm"
+    - chown -R builder:builder .
+    - su builder -c "scripts/generate-aur-package.sh '${CI_COMMIT_TAG#v}' --pkgrel 1 && cd dist/aur && makepkg --noconfirm"
   artifacts:
     paths:
       - dist/aur/PKGBUILD
