@@ -47,6 +47,99 @@ const REFINE_COMMON_DENOMINATOR: usize = 4;
 /// sections 6 and 39): better no pairing than a wrong one.
 pub const MIN_PAIR_SIMILARITY: f64 = 0.5;
 
+/// Maximum number of lines of a change block analyzed for pairing
+/// (DIFF.md sections 33 and 34): bigger blocks fall back to no pairing.
+pub const MAX_CHANGE_BLOCK_LINES: usize = 64;
+
+/// A pairing between a removed line and an added line of one change block.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LinePair {
+    /// Index of the removed line in its change block.
+    pub removed: usize,
+    /// Index of the added line in its change block.
+    pub added: usize,
+}
+
+/// Pairs the removed and added lines of one change block (DIFF.md sections 4
+/// and 5).
+///
+/// The result is order preserving (DIFF.md section 7): pairs never cross, like
+/// a sequence alignment. Lines with no convincing counterpart are simply left
+/// unpaired (DIFF.md section 6), and blocks over [`MAX_CHANGE_BLOCK_LINES`]
+/// lines get no pairing at all.
+pub fn pair_lines(removed: &[&str], added: &[&str]) -> Vec<LinePair> {
+    let (n, m) = (removed.len(), added.len());
+    if n == 0 || m == 0 || n > MAX_CHANGE_BLOCK_LINES || m > MAX_CHANGE_BLOCK_LINES {
+        return Vec::new();
+    }
+
+    // Similarity of every possibly pairable line pair; 0.0 marks pairs that
+    // must not be matched (below the threshold).
+    let mut similarity = vec![0.0; n * m];
+    for (i, old) in removed.iter().enumerate() {
+        for (j, new) in added.iter().enumerate() {
+            if let Some(value) = pairable_similarity(old, new) {
+                similarity[i * m + j] = value;
+            }
+        }
+    }
+
+    // Best total similarity of an order preserving matching of the suffixes.
+    let mut best = vec![0.0; (n + 1) * (m + 1)];
+    for i in (0..n).rev() {
+        for j in (0..m).rev() {
+            let take = if similarity[i * m + j] > 0.0 {
+                similarity[i * m + j] + best[(i + 1) * (m + 1) + j + 1]
+            } else {
+                0.0
+            };
+            best[i * (m + 1) + j] = take
+                .max(best[(i + 1) * (m + 1) + j])
+                .max(best[i * (m + 1) + j + 1]);
+        }
+    }
+
+    // Walk back, preferring a pairing on ties.
+    let mut pairs = Vec::new();
+    let (mut i, mut j) = (0, 0);
+    while i < n && j < m {
+        let take = if similarity[i * m + j] > 0.0 {
+            similarity[i * m + j] + best[(i + 1) * (m + 1) + j + 1]
+        } else {
+            -1.0
+        };
+        if take > 0.0 && take >= best[i * (m + 1) + j] {
+            pairs.push(LinePair {
+                removed: i,
+                added: j,
+            });
+            i += 1;
+            j += 1;
+        } else if best[(i + 1) * (m + 1) + j] >= best[i * (m + 1) + j + 1] {
+            i += 1;
+        } else {
+            j += 1;
+        }
+    }
+    pairs
+}
+
+/// Similarity of two pairable lines, or `None` when they must not be paired.
+fn pairable_similarity(old: &str, new: &str) -> Option<f64> {
+    // Cheap length bound: very different lengths can never reach the
+    // threshold, so the full comparison is skipped (DIFF.md section 33).
+    let (short, long) = if old.len() <= new.len() {
+        (old.len(), new.len())
+    } else {
+        (new.len(), old.len())
+    };
+    if short * 3 < long {
+        return None;
+    }
+    let similarity = line_similarity(old, new);
+    (similarity >= MIN_PAIR_SIMILARITY).then_some(similarity)
+}
+
 /// A changed part of a line.
 ///
 /// Offsets are character offsets (Unicode scalar values) into the line text and
@@ -384,6 +477,14 @@ mod tests {
         (changed(old, &spans.old), changed(new, &spans.new))
     }
 
+    /// Pairings as plain index tuples, for readable expectations.
+    fn pairs(removed: &[&str], added: &[&str]) -> Vec<(usize, usize)> {
+        pair_lines(removed, added)
+            .into_iter()
+            .map(|pair| (pair.removed, pair.added))
+            .collect()
+    }
+
     #[test]
     fn single_number() {
         // DIFF.md section 38: the whole number tokens are the change.
@@ -476,6 +577,93 @@ mod tests {
         assert_eq!(line_similarity("", ""), 1.0);
         assert_eq!(line_similarity("", "content"), 0.0);
         assert!(line_similarity("foo = bar;", "foo  = bar;") > MIN_PAIR_SIMILARITY);
+    }
+
+    #[test]
+    fn one_to_one_pairing() {
+        // DIFF.md section 39.
+        assert_eq!(pairs(&["a = 1"], &["a = 2"]), vec![(0, 0)]);
+    }
+
+    #[test]
+    fn two_to_two_pairing() {
+        assert_eq!(
+            pairs(
+                &["foo(\"a\");", "bar(\"b\");"],
+                &["foo(\"x\");", "bar(\"y\");"]
+            ),
+            vec![(0, 0), (1, 1)]
+        );
+    }
+
+    #[test]
+    fn two_to_three_pairing_leaves_the_inserted_line_unpaired() {
+        // baz() is a new line and must not steal any pairing (DIFF.md §39).
+        assert_eq!(
+            pairs(
+                &["foo(\"a\");", "bar(\"b\");"],
+                &["foo(\"x\");", "baz();", "bar(\"y\");"]
+            ),
+            vec![(0, 0), (1, 2)]
+        );
+    }
+
+    #[test]
+    fn unrelated_lines_are_not_paired() {
+        // DIFF.md sections 6 and 39.
+        assert!(pairs(&["initialize_database();"], &["return Error::Timeout;"]).is_empty());
+    }
+
+    #[test]
+    fn reordered_lines_never_cross() {
+        // DIFF.md section 39: no visually absurd associations.
+        let result = pairs(&["aaa bbb", "ccc ddd"], &["ccc DDD", "AAA bbb"]);
+        assert!(result.len() <= 1);
+        for pair in result.windows(2) {
+            assert!(
+                pair[0].0 < pair[1].0 && pair[0].1 < pair[1].1,
+                "pairs must not cross: {result:?}"
+            );
+        }
+        assert_eq!(result, vec![(1, 0)]);
+    }
+
+    #[test]
+    fn pairings_are_order_preserving() {
+        let result = pairs(
+            &["one old line", "two old line", "three old line"],
+            &[
+                "one new line",
+                "unrelated insert",
+                "three new line",
+                "two new line",
+            ],
+        );
+        for pair in result.windows(2) {
+            assert!(
+                pair[0].0 < pair[1].0 && pair[0].1 < pair[1].1,
+                "pairs must not cross: {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn empty_change_blocks_have_no_pairs() {
+        assert!(pairs(&[], &["x"]).is_empty());
+        assert!(pairs(&["x"], &[]).is_empty());
+    }
+
+    #[test]
+    fn huge_change_blocks_fall_back_to_no_pairing() {
+        let removed: Vec<String> = (0..MAX_CHANGE_BLOCK_LINES + 1)
+            .map(|i| format!("old {i}"))
+            .collect();
+        let added: Vec<String> = (0..MAX_CHANGE_BLOCK_LINES + 1)
+            .map(|i| format!("new {i}"))
+            .collect();
+        let removed: Vec<&str> = removed.iter().map(String::as_str).collect();
+        let added: Vec<&str> = added.iter().map(String::as_str).collect();
+        assert!(pairs(&removed, &added).is_empty());
     }
 
     #[test]
