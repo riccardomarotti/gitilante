@@ -32,6 +32,7 @@ Generates dist/aur/PKGBUILD and dist/aur/.SRCINFO for a release.
 
 Arguments:
   <version>   release version, with or without the leading "v" (e.g. 0.2.0)
+  --pkgrel N  package release number (default: 1; bump on packaging-only changes)
   --local     build the source archive from the local repository instead of
               downloading the GitLab tag archive. The checksum then refers to
               the local archive: the result is for testing only and must not
@@ -41,6 +42,7 @@ EOF
 }
 
 VERSION=""
+PKGREL=1
 LOCAL=0
 REF="HEAD"
 
@@ -58,6 +60,11 @@ while [ $# -gt 0 ]; do
             [ $# -gt 0 ] || die "--ref requires a value"
             REF="$1"
             ;;
+        --pkgrel)
+            shift
+            [ $# -gt 0 ] || die "--pkgrel requires a value"
+            PKGREL="$1"
+            ;;
         -*)
             die "unknown option: $1"
             ;;
@@ -74,6 +81,7 @@ done
 # Tolerate a tag-shaped input; the version is always without the leading "v".
 VERSION="${VERSION#v}"
 [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "invalid version: $VERSION (expected MAJOR.MINOR.PATCH)"
+[[ "$PKGREL" =~ ^[0-9]+$ ]] || die "invalid package release: $PKGREL (expected a number)"
 TAG="v$VERSION"
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -90,6 +98,7 @@ SOURCE_URL="$PROJECT_URL/-/archive/$TAG/$EXTRACTED_DIR.tar.gz"
 mkdir -p "$OUT_DIR"
 
 log "Release version: $VERSION"
+log "Package release: $PKGREL"
 log "Tag: $TAG"
 
 if [ "$LOCAL" -eq 1 ]; then
@@ -104,8 +113,8 @@ SHA256="$(sha256sum "$OUT_DIR/$ARCHIVE_NAME" | cut -d' ' -f1)"
 log "SHA256: $SHA256"
 
 log "Generating PKGBUILD..."
-sed -e "s/@VERSION@/$VERSION/g" -e "s/@SHA256@/$SHA256/g" "$PKGBUILD_TEMPLATE" >"$OUT_DIR/PKGBUILD"
-if grep -q '@VERSION@\|@SHA256@' "$OUT_DIR/PKGBUILD"; then
+sed -e "s/@VERSION@/$VERSION/g" -e "s/@PKGREL@/$PKGREL/g" -e "s/@SHA256@/$SHA256/g" "$PKGBUILD_TEMPLATE" >"$OUT_DIR/PKGBUILD"
+if grep -q '@VERSION@\|@PKGREL@\|@SHA256@' "$OUT_DIR/PKGBUILD"; then
     die "unreplaced placeholders left in $OUT_DIR/PKGBUILD"
 fi
 

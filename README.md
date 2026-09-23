@@ -43,6 +43,8 @@ cargo install --path .
 gitilante .
 ```
 
+The Arch package also installs the short command name `gila` as an alias.
+
 ```text
 Usage: gitilante [path]
 
