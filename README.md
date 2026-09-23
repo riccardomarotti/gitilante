@@ -6,8 +6,7 @@ changes and manipulating single hunks.
 
 Gitilante is a thin frontend over the `git` executable: it never reimplements
 Git semantics and deliberately does not replace the CLI (no commit, push,
-branch, merge, ...). See [SPEC.md](SPEC.md) for the full technical and
-functional specification.
+branch, merge, ...).
 
 ## Features (v0.1)
 
@@ -69,9 +68,6 @@ cargo test
 cargo clippy --all-targets
 cargo fmt
 ```
-
-The acceptance criteria (SPEC.md, section 34) are tracked in
-[ACCEPTANCE.md](ACCEPTANCE.md).
 
 ## Packaging
 
