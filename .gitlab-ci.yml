@@ -32,7 +32,7 @@ default:
 
 .install-deps:
   before_script:
-    - pacman -Syu --noconfirm --needed git rust gtk4 libadwaita
+    - pacman -Syu --noconfirm --needed git gtksourceview5 rust gtk4 libadwaita xorg-server-xvfb
 
 check-version:
   stage: check
@@ -46,7 +46,7 @@ test:
   script:
     - echo "Running tests..."
     - cargo fetch --locked
-    - cargo test --frozen
+    - xvfb-run -a cargo test --frozen
 
 build:
   stage: build

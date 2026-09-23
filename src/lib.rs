@@ -6,4 +6,5 @@
 pub mod git;
 pub mod intraline;
 pub mod model;
+pub mod syntax;
 pub mod ui;

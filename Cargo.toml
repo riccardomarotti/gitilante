@@ -12,6 +12,7 @@ env_logger = "0.11"
 gtk4 = "0.11"
 libadwaita = { version = "0.9", features = ["v1_5"] }
 log = "0.4"
+sourceview5 = "0.11.2"
 unicode-segmentation = "1.13.3"
 
 [profile.dev]
