@@ -126,6 +126,25 @@ impl Repository {
         )
     }
 
+    /// Reverts a single hunk of a commit diff into the working tree (SPEC §18).
+    ///
+    /// The inverse of the change introduced by the commit is applied to the
+    /// working tree with `git apply --reverse` after a dry run. No commit is
+    /// created: the result shows up as a normal local modification. If the file
+    /// changed since the commit, nothing is modified and
+    /// [`Error::HunkCannotBeReverted`] is returned.
+    pub fn revert_commit_hunk(&self, file: &FileDiff, hunk: &Hunk) -> Result<()> {
+        match patch::apply(
+            &self.root,
+            &patch::single_hunk_patch(file, hunk),
+            ApplyTarget::WorkTree,
+            true,
+        ) {
+            Err(Error::PatchDoesNotApply { stderr }) => Err(Error::HunkCannotBeReverted { stderr }),
+            result => result,
+        }
+    }
+
     /// Stages every change of the entry's path (SPEC §15).
     ///
     /// Works for modified files, whole deletions and untracked files.

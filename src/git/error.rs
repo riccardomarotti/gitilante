@@ -51,6 +51,9 @@ pub enum Error {
     /// A patch (or its reverse) no longer applies cleanly: the repository
     /// changed after the diff it was built from was read.
     PatchDoesNotApply { stderr: String },
+    /// A historical hunk cannot be reverted cleanly: the file has diverged
+    /// since its commit (SPEC section 18).
+    HunkCannotBeReverted { stderr: String },
     /// `git` produced output that could not be parsed.
     MalformedOutput { command: String, detail: String },
 }
@@ -67,6 +70,12 @@ impl fmt::Display for Error {
                 write!(
                     f,
                     "This hunk can no longer be applied because the file has changed.\n\n{stderr}"
+                )
+            }
+            Self::HunkCannotBeReverted { stderr } => {
+                write!(
+                    f,
+                    "Cannot revert this hunk cleanly because the file has changed since this commit.\n\n{stderr}"
                 )
             }
             Self::MalformedOutput { command, detail } => {

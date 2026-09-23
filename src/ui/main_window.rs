@@ -500,6 +500,7 @@ impl Inner {
                     }
                 })
             },
+            revert_hunk: op2_callback(&weak, Inner::revert_hunk),
             stage_file: op_callback(&weak, Inner::stage_file),
             unstage_file: op_callback(&weak, Inner::unstage_file),
             discard_file: {
@@ -525,6 +526,10 @@ impl Inner {
 
     fn discard_hunk(&self, file: FileDiff, hunk: Hunk) {
         self.run_op(move |repo| repo.discard_hunk(&file, &hunk));
+    }
+
+    fn revert_hunk(&self, file: FileDiff, hunk: Hunk) {
+        self.run_op(move |repo| repo.revert_commit_hunk(&file, &hunk));
     }
 
     fn stage_file(&self, path: PathBuf) {
@@ -735,6 +740,10 @@ fn toast_message(error: &Error) -> String {
     match error {
         Error::PatchDoesNotApply { .. } => {
             "This hunk can no longer be applied because the file has changed.".to_owned()
+        }
+        Error::HunkCannotBeReverted { .. } => {
+            "Cannot revert this hunk cleanly because the file has changed since this commit."
+                .to_owned()
         }
         Error::Git(git_error) => {
             let detail = git_error

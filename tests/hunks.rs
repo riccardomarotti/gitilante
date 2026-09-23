@@ -10,17 +10,8 @@ use std::ffi::OsString;
 use std::os::unix::ffi::OsStringExt;
 use std::path::PathBuf;
 
-use common::{TestRepo, file, numbered_lines};
+use common::{TestRepo, changed_lines, file, numbered_lines};
 use gitilante::git::Error;
-
-/// Builds numbered content with the given lines replaced.
-fn changed_lines(count: usize, replacements: &[(&str, &str)]) -> Vec<u8> {
-    let mut content = String::from_utf8(numbered_lines(count)).unwrap();
-    for (from, to) in replacements {
-        content = content.replace(from, to);
-    }
-    content.into_bytes()
-}
 
 #[test]
 fn stage_single_hunk_out_of_three() {

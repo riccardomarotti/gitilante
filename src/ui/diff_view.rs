@@ -25,6 +25,8 @@ pub struct Callbacks {
     /// Discard one hunk of a working tree diff (the caller asks for
     /// confirmation first).
     pub discard_hunk: Box<dyn Fn(FileDiff, Hunk)>,
+    /// Revert one hunk of a commit diff into the working tree (SPEC §18).
+    pub revert_hunk: Box<dyn Fn(FileDiff, Hunk)>,
     /// Stage every change of the given path.
     pub stage_file: Box<dyn Fn(PathBuf)>,
     /// Unstage every change of the given path.
@@ -176,7 +178,15 @@ fn hunk_view(
                 move || (callbacks.discard_hunk)(file.clone(), hunk.clone())
             }));
         }
-        DiffSide::History => {}
+        // Historical commits get their actions in Fase 6 (Revert hunk).
+        DiffSide::History => {
+            header.append(&file_button("Revert hunk", {
+                let file = file.clone();
+                let hunk = hunk.clone();
+                let callbacks = callbacks.clone();
+                move || (callbacks.revert_hunk)(file.clone(), hunk.clone())
+            }));
+        }
     }
     block.append(&header);
     block.append(&hunk_body(hunk));

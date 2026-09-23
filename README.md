@@ -17,6 +17,8 @@ functional specification.
 - monospace diff viewer with line numbers;
 - History view with incremental loading (200 commits at a time) and the
   commit diff shown with the same renderer when a commit is selected;
+- Revert a single hunk of a commit into the working tree, without creating
+  any commit;
 - binary files shown as such, with whole-file actions;
 - refresh after every operation, on window focus, and with `Ctrl+R`.
 

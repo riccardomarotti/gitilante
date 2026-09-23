@@ -30,6 +30,15 @@ pub fn numbered_lines(count: usize) -> Vec<u8> {
         .into_bytes()
 }
 
+/// Builds numbered content with the given lines replaced.
+pub fn changed_lines(count: usize, replacements: &[(&str, &str)]) -> Vec<u8> {
+    let mut content = String::from_utf8(numbered_lines(count)).unwrap();
+    for (from, to) in replacements {
+        content = content.replace(from, to);
+    }
+    content.into_bytes()
+}
+
 /// A temporary Git repository with a hermetic configuration.
 pub struct TestRepo {
     root: PathBuf,
