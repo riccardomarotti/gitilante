@@ -20,7 +20,9 @@ functional specification.
 - Revert a single hunk of a commit into the working tree, without creating
   any commit;
 - binary files shown as such, with whole-file actions;
-- refresh after every operation, on window focus, and with `Ctrl+R`.
+- conflicted files listed in their own read-only section;
+- refresh after every operation, on window focus, and with `Ctrl+R`;
+- keyboard shortcuts acting on the focused hunk (`S`, `U`, `D`, `R`).
 
 ## Requirements
 
@@ -48,6 +50,10 @@ Usage: gitilante [path]
 Shortcuts:
   Ctrl+R         Refresh
   Ctrl+Q         Quit
+  S              Stage the focused hunk
+  U              Unstage the focused hunk
+  D              Discard the focused hunk (asks for confirmation)
+  R              Revert the focused hunk of a commit
 ```
 
 Diagnostics are logged through `env_logger` (`RUST_LOG=debug` shows every Git
@@ -63,3 +69,11 @@ cargo test
 cargo clippy --all-targets
 cargo fmt
 ```
+
+The acceptance criteria (SPEC.md, section 34) are tracked in
+[ACCEPTANCE.md](ACCEPTANCE.md).
+
+## Packaging
+
+An Arch Linux `PKGBUILD` is provided in `packaging/arch/`; see the comment at
+the top of the file for how to build a package from this tree.

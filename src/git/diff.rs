@@ -69,7 +69,12 @@ pub fn parse(input: &[u8]) -> ParseResult<Diff> {
     let mut in_binary_patch = false;
 
     for line in lines {
-        if line.starts_with(b"diff --git ") {
+        // `git diff --cached` reports unmerged paths with a star record instead
+        // of a diff; unmerged state is already visible in the status.
+        if line.starts_with(b"* Unmerged path ") {
+            continue;
+        }
+        if line.starts_with(b"diff --git ") || line.starts_with(b"diff --cc ") {
             if let Some(previous) = file.take() {
                 diff.files.push(previous.finish(&mut flags));
             }
@@ -85,14 +90,19 @@ pub fn parse(input: &[u8]) -> ParseResult<Diff> {
                 binary: false,
                 hunks: Vec::new(),
             });
-        } else if line.starts_with(b"@@ ") {
+        } else if line.starts_with(b"@@ ") || line.starts_with(b"@@@ ") {
             let current = file.as_mut().ok_or_else(|| {
                 format!(
                     "hunk header outside of any file: {:?}",
                     String::from_utf8_lossy(line)
                 )
             })?;
-            let (old_start, old_count, new_start, new_count) = parse_hunk_header(line)?;
+            // `@@@` headers belong to combined diffs of conflicted files.
+            let (old_start, old_count, new_start, new_count) = if line.starts_with(b"@@@ ") {
+                parse_combined_hunk_header(line)
+            } else {
+                parse_hunk_header(line)?
+            };
             current.hunks.push(Hunk {
                 old_start,
                 old_count,
@@ -111,12 +121,16 @@ pub fn parse(input: &[u8]) -> ParseResult<Diff> {
                 .push(line.to_vec());
         } else if in_hunk {
             let current = file.as_mut().expect("hunk inside a file");
+            let combined = current
+                .hunks
+                .last()
+                .is_some_and(|hunk| hunk.header.starts_with(b"@@@"));
             current
                 .hunks
                 .last_mut()
                 .expect("hunk was started")
                 .lines
-                .push(parse_hunk_line(line)?);
+                .push(parse_hunk_line(line, combined)?);
         } else if let Some(current) = file.as_mut() {
             parse_metadata(current, &mut flags, line)?;
             in_binary_patch = flags.binary_patch;
@@ -223,29 +237,82 @@ fn parse_metadata(file: &mut FileDiff, flags: &mut FileFlags, line: &[u8]) -> Pa
 }
 
 /// Parses one hunk line: marker byte plus raw content.
-fn parse_hunk_line(line: &[u8]) -> ParseResult<DiffLine> {
-    let (kind, content) = match line.first() {
-        Some(b' ') => (DiffLineKind::Context, &line[1..]),
-        Some(b'+') => (DiffLineKind::Addition, &line[1..]),
-        Some(b'-') => (DiffLineKind::Deletion, &line[1..]),
-        Some(b'\\') => (DiffLineKind::NoNewlineMarker, &line[1..]),
+/// Parses one hunk line: marker bytes plus raw content.
+///
+/// Combined diffs of conflicted files prefix every line with one marker per
+/// parent (typically two); their content starts after all of them.
+fn parse_hunk_line(line: &[u8], combined: bool) -> ParseResult<DiffLine> {
+    let first = line.first().copied();
+    let (markers, content) = match first {
+        Some(b' ') | Some(b'+') | Some(b'-') => {
+            let mut start = 1;
+            if combined && matches!(line.get(1), Some(b' ') | Some(b'+') | Some(b'-')) {
+                start = 2;
+            }
+            (&line[..start], &line[start..])
+        }
+        Some(b'\\') => {
+            return Ok(DiffLine {
+                kind: DiffLineKind::NoNewlineMarker,
+                content: line[1..].to_vec(),
+            });
+        }
         // Tolerate empty context lines without their marker (some tools emit
         // them); Git itself always writes the leading space.
-        None => (DiffLineKind::Context, line),
+        None => (&b""[..], line),
         Some(other) => {
             return Err(format!(
                 "unexpected line in hunk: {:?}",
                 String::from_utf8_lossy(line)
                     .chars()
                     .next()
-                    .unwrap_or(*other as char)
+                    .unwrap_or(other as char)
             ));
         }
+    };
+    let kind = if markers.contains(&b'+') {
+        DiffLineKind::Addition
+    } else if markers.contains(&b'-') {
+        DiffLineKind::Deletion
+    } else {
+        DiffLineKind::Context
     };
     Ok(DiffLine {
         kind,
         content: content.to_vec(),
     })
+}
+
+/// Parses the ranges of a combined hunk header (`@@@ -a,b -c,d +e,f @@@`):
+/// the first range is the old side, the last one the new side.
+///
+/// The header is kept verbatim and parsing is lenient: conflicted files are
+/// shown read-only, so approximate numbers are fine as long as nothing breaks.
+fn parse_combined_hunk_header(line: &[u8]) -> (usize, usize, usize, usize) {
+    let Some(spec) = line.strip_prefix(b"@@@ ") else {
+        return (0, 0, 0, 0);
+    };
+    let mut old = None;
+    let mut new = None;
+    for token in spec.split(|byte| *byte == b' ') {
+        if token.starts_with(b"-") {
+            if let Ok((start, count, _)) = parse_range(token, b'-') {
+                if old.is_none() {
+                    old = Some((start, count));
+                }
+            }
+        } else if token.starts_with(b"+") {
+            if let Ok((start, count, _)) = parse_range(token, b'+') {
+                new = Some((start, count));
+            }
+        }
+    }
+    match (old, new) {
+        (Some((old_start, old_count)), Some((new_start, new_count))) => {
+            (old_start, old_count, new_start, new_count)
+        }
+        _ => (0, 0, 0, 0),
+    }
 }
 
 /// Parses `@@ -old[,count] +new[,count] @@ ...`; omitted counts mean 1.
@@ -320,6 +387,11 @@ fn path_from_bytes(bytes: Vec<u8>) -> PathBuf {
 /// unquoted names containing spaces make the line ambiguous, so a symmetric
 /// split (both sides equal) is preferred, then the first ` b/` split.
 fn parse_diff_git_header(line: &[u8]) -> (Option<PathBuf>, Option<PathBuf>) {
+    // Combined diffs of conflicted files carry a single path.
+    if let Some(spec) = line.strip_prefix(b"diff --cc ") {
+        let path = parse_path_field(spec).ok().flatten();
+        return (path.clone(), path);
+    }
     let Some(spec) = line.strip_prefix(b"diff --git ") else {
         return (None, None);
     };
@@ -582,6 +654,37 @@ mod tests {
         let hunk = &diff.files[0].hunks[0];
         assert_eq!(hunk.lines[1].kind, DiffLineKind::Context);
         assert_eq!(hunk.lines[1].content, b"");
+    }
+
+    #[test]
+    fn parses_combined_diffs_of_conflicted_files() {
+        let diff = parse(
+            b"diff --cc f.txt\nindex af70335,f794161..0000000\n--- a/f.txt\n+++ b/f.txt\n@@@ -1,3 -1,3 +1,7 @@@\n  a\n++<<<<<<< HEAD\n +MAIN\n++=======\n+ SIDE\n++>>>>>>> side\n  c\n",
+        )
+        .unwrap();
+        let file = &diff.files[0];
+        assert_eq!(file.path(), Some(std::path::Path::new("f.txt")));
+        assert_eq!(file.hunks.len(), 1);
+        let hunk = &file.hunks[0];
+        assert_eq!((hunk.old_start, hunk.old_count), (1, 3));
+        assert_eq!((hunk.new_start, hunk.new_count), (1, 7));
+        assert_eq!(hunk.header, b"@@@ -1,3 -1,3 +1,7 @@@");
+        // Two markers per line (one per parent) before the content.
+        assert_eq!(hunk.lines.len(), 7);
+        assert_eq!(hunk.lines[0].kind, DiffLineKind::Context);
+        assert_eq!(hunk.lines[0].content, b"a");
+        assert_eq!(hunk.lines[1].kind, DiffLineKind::Addition);
+        assert_eq!(hunk.lines[1].content, b"<<<<<<< HEAD");
+        assert_eq!(hunk.lines[2].content, b"MAIN");
+        assert_eq!(hunk.lines[4].content, b"SIDE");
+        assert_eq!(hunk.lines[6].kind, DiffLineKind::Context);
+        assert_eq!(hunk.lines[6].content, b"c");
+    }
+
+    #[test]
+    fn unmerged_star_records_are_skipped() {
+        let diff = parse(b"* Unmerged path f.txt\n").unwrap();
+        assert!(diff.is_empty());
     }
 
     #[test]

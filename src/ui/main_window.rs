@@ -7,7 +7,7 @@
 //! - loads history in blocks and commit diffs only when selected;
 //! - reports errors with toasts, reserving dialogs for decisions (discard).
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
 use std::rc::{Rc, Weak};
 
@@ -23,7 +23,7 @@ use crate::model::commit::Commit;
 use crate::model::diff::{Diff, FileDiff, Hunk};
 use crate::model::status::{Status, StatusEntry};
 use crate::ui::worker::Worker;
-use crate::ui::{DiffSide, Selection, changes, diff_view, history, short_path};
+use crate::ui::{DiffSide, HunkTarget, Selection, changes, diff_view, history, short_path};
 
 /// Commits per history block (SPEC section 16).
 const HISTORY_PAGE: usize = 200;
@@ -55,16 +55,21 @@ struct State {
     commit_diff: Option<(String, Diff)>,
     /// Bumped on every selection change; stale commit diffs are dropped.
     commit_diff_generation: u64,
+    /// Hunk that has keyboard focus, target of the contextual shortcuts.
+    current_hunk: Option<HunkTarget>,
 }
 
 struct Inner {
     repo: Repository,
     worker: Worker,
     state: RefCell<State>,
+    /// In-flight requests, shown by the header bar spinner.
+    busy: Cell<u32>,
     self_weak: Weak<Inner>,
     window: adw::ApplicationWindow,
     toast_overlay: adw::ToastOverlay,
     subtitle: adw::WindowTitle,
+    spinner: gtk4::Spinner,
     changes: changes::ChangesView,
     history_view: history::HistoryView,
     diff_box: GtkBox,
@@ -101,6 +106,12 @@ impl Inner {
         refresh_button.set_tooltip_text(Some("Refresh (Ctrl+R)"));
         refresh_button.set_action_name(Some("win.refresh"));
         header.pack_end(&refresh_button);
+
+        // Loading state: spins while any Git request is in flight (SPEC §35).
+        let spinner = gtk4::Spinner::new();
+        spinner.set_visible(false);
+        spinner.set_tooltip_text(Some("Loading…"));
+        header.pack_end(&spinner);
 
         let changes = changes::ChangesView::new(changes::Callbacks {
             select: {
@@ -197,6 +208,23 @@ impl Inner {
         }
         window.add_action(&refresh_action);
 
+        // Contextual hunk shortcuts, acting on the focused hunk (SPEC §30).
+        for (name, activate) in [
+            ("stage-hunk", Inner::shortcut_stage_hunk as fn(&Inner)),
+            ("unstage-hunk", Inner::shortcut_unstage_hunk),
+            ("discard-hunk", Inner::shortcut_discard_hunk),
+            ("revert-hunk", Inner::shortcut_revert_hunk),
+        ] {
+            let action = gio::SimpleAction::new(name, None);
+            let weak = self_weak.clone();
+            action.connect_activate(move |_, _| {
+                if let Some(inner) = weak.upgrade() {
+                    activate(&inner);
+                }
+            });
+            window.add_action(&action);
+        }
+
         // Refresh when the window regains focus (SPEC section 20).
         {
             let weak = self_weak.clone();
@@ -213,14 +241,33 @@ impl Inner {
             repo,
             worker: Worker::new(),
             state: RefCell::new(State::default()),
+            busy: Cell::new(0),
             self_weak,
             window,
             toast_overlay,
             subtitle,
+            spinner,
             changes,
             history_view,
             diff_box,
             diff_scroll,
+        }
+    }
+
+    /// Shows the loading state while a request is in flight.
+    fn busy_start(&self) {
+        self.busy.set(self.busy.get() + 1);
+        self.spinner.set_visible(true);
+        self.spinner.start();
+    }
+
+    /// Hides the loading state when no request is in flight anymore.
+    fn busy_finish(&self) {
+        let remaining = self.busy.get().saturating_sub(1);
+        self.busy.set(remaining);
+        if remaining == 0 {
+            self.spinner.stop();
+            self.spinner.set_visible(false);
         }
     }
 
@@ -233,6 +280,7 @@ impl Inner {
             state.generation += 1;
             state.generation
         };
+        self.busy_start();
         let repo = self.repo.clone();
         let weak = self.self_weak.clone();
         self.worker.run(
@@ -277,6 +325,7 @@ impl Inner {
             }
             state.history_loading = true;
         }
+        self.busy_start();
         self.render_history();
 
         let repo = self.repo.clone();
@@ -292,6 +341,7 @@ impl Inner {
     }
 
     fn finish_history(&self, append: bool, requested: usize, result: Result<Vec<Commit>, Error>) {
+        self.busy_finish();
         match result {
             Ok(commits) => {
                 let mut state = self.state.borrow_mut();
@@ -313,6 +363,7 @@ impl Inner {
 
     /// Applies a refresh result unless a newer refresh superseded it.
     fn finish_refresh(&self, generation: u64, result: Result<RefreshData, Error>) {
+        self.busy_finish();
         {
             let mut state = self.state.borrow_mut();
             if state.generation != generation {
@@ -351,6 +402,7 @@ impl Inner {
 
     /// Loads the diff of a commit, dropping results that became stale.
     fn load_commit_diff(&self, generation: u64, oid: String) {
+        self.busy_start();
         let repo = self.repo.clone();
         let weak = self.self_weak.clone();
         let requested = oid.clone();
@@ -365,6 +417,7 @@ impl Inner {
     }
 
     fn finish_commit_diff(&self, generation: u64, oid: String, result: Result<Diff, Error>) {
+        self.busy_finish();
         match result {
             Ok(diff) => {
                 let mut state = self.state.borrow_mut();
@@ -437,7 +490,9 @@ impl Inner {
 
     /// Rebuilds the diff pane for the current selection.
     fn render_diff(&self) {
-        let state = self.state.borrow();
+        let mut state = self.state.borrow_mut();
+        // Focus tracking starts over with the new widgets.
+        state.current_hunk = None;
         while let Some(child) = self.diff_box.first_child() {
             self.diff_box.remove(&child);
         }
@@ -453,6 +508,10 @@ impl Inner {
             },
             Some(Selection::Unstaged(path)) => match state.data.as_ref() {
                 Some(data) => self.render_file_diff(&data.worktree, path, DiffSide::Unstaged),
+                None => diff_view::placeholder("Loading…"),
+            },
+            Some(Selection::Conflicted(path)) => match state.data.as_ref() {
+                Some(data) => self.render_file_diff(&data.worktree, path, DiffSide::Conflicted),
                 None => diff_view::placeholder("Loading…"),
             },
             Some(Selection::Commit(oid)) => match &state.commit_diff {
@@ -503,6 +562,7 @@ impl Inner {
             revert_hunk: op2_callback(&weak, Inner::revert_hunk),
             stage_file: op_callback(&weak, Inner::stage_file),
             unstage_file: op_callback(&weak, Inner::unstage_file),
+            focus_hunk: op_callback(&weak, Inner::focus_hunk),
             discard_file: {
                 let weak = weak.clone();
                 Box::new(move |path: PathBuf| {
@@ -515,6 +575,44 @@ impl Inner {
     }
 
     // --- operations ------------------------------------------------------
+
+    /// Remembers the hunk that has keyboard focus.
+    fn focus_hunk(&self, target: HunkTarget) {
+        self.state.borrow_mut().current_hunk = Some(target);
+    }
+
+    /// The focused hunk, when it comes from `side`.
+    fn focused_hunk(&self, side: DiffSide) -> Option<HunkTarget> {
+        self.state
+            .borrow()
+            .current_hunk
+            .clone()
+            .filter(|target| target.side == side)
+    }
+
+    fn shortcut_stage_hunk(&self) {
+        if let Some(target) = self.focused_hunk(DiffSide::Unstaged) {
+            self.stage_hunk(target.file, target.hunk);
+        }
+    }
+
+    fn shortcut_unstage_hunk(&self) {
+        if let Some(target) = self.focused_hunk(DiffSide::Staged) {
+            self.unstage_hunk(target.file, target.hunk);
+        }
+    }
+
+    fn shortcut_discard_hunk(&self) {
+        if let Some(target) = self.focused_hunk(DiffSide::Unstaged) {
+            self.confirm_discard_hunk(target.file, target.hunk);
+        }
+    }
+
+    fn shortcut_revert_hunk(&self) {
+        if let Some(target) = self.focused_hunk(DiffSide::History) {
+            self.revert_hunk(target.file, target.hunk);
+        }
+    }
 
     fn stage_hunk(&self, file: FileDiff, hunk: Hunk) {
         self.run_op(move |repo| repo.stage_hunk(&file, &hunk));
@@ -557,12 +655,14 @@ impl Inner {
     where
         F: FnOnce(&Repository) -> Result<(), Error> + Send + 'static,
     {
+        self.busy_start();
         let repo = self.repo.clone();
         let weak = self.self_weak.clone();
         self.worker.run(
             move || op(&repo),
             move |result| {
                 if let Some(inner) = weak.upgrade() {
+                    inner.busy_finish();
                     if let Err(error) = result {
                         inner.show_error(&error);
                     }
@@ -689,6 +789,7 @@ fn selection_exists(status: &Status, selection: &Selection) -> bool {
         Selection::Staged(path) => status.staged_entries().any(|entry| entry.path == *path),
         Selection::Unstaged(path) => status.unstaged_entries().any(|entry| entry.path == *path),
         Selection::Untracked(path) => status.untracked_entries().any(|entry| entry.path == *path),
+        Selection::Conflicted(path) => status.unmerged_entries().any(|entry| entry.path == *path),
         // Commits are immutable: a selected commit stays valid across refreshes.
         Selection::Commit(_) => true,
     }

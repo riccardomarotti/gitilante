@@ -25,6 +25,10 @@ Options:
 Shortcuts:
   Ctrl+R         Refresh
   Ctrl+Q         Quit
+  S              Stage the focused hunk
+  U              Unstage the focused hunk
+  D              Discard the focused hunk (asks for confirmation)
+  R              Revert the focused hunk of a commit
 ";
 
 /// What the command line asked for.

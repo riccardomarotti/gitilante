@@ -21,6 +21,19 @@ pub enum Selection {
     Untracked(PathBuf),
     /// A commit of the History view (by object name).
     Commit(String),
+    /// A conflicted (unmerged) file, shown read-only.
+    Conflicted(PathBuf),
+}
+
+/// A hunk that has keyboard focus, with its file and side.
+#[derive(Debug, Clone)]
+pub struct HunkTarget {
+    /// File diff the hunk belongs to.
+    pub file: crate::model::diff::FileDiff,
+    /// The hunk itself.
+    pub hunk: crate::model::diff::Hunk,
+    /// Side the diff was taken from.
+    pub side: DiffSide,
 }
 
 /// Side of the repository a diff is taken from.
@@ -32,6 +45,8 @@ pub enum DiffSide {
     Unstaged,
     /// A historical commit (`git show`); hunks get their actions in Fase 6.
     History,
+    /// A conflicted file (combined diff), read-only.
+    Conflicted,
 }
 
 /// Short letter describing a change kind.

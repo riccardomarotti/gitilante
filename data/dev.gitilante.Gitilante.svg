@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <!-- Gitilante: a minimal diff (removed line, added line). -->
+  <rect x="4" y="4" width="56" height="56" rx="12" fill="#241f31"/>
+  <rect x="14" y="17" width="36" height="9" rx="4.5" fill="#e01b24"/>
+  <g fill="#2ec27e">
+    <rect x="14" y="38" width="36" height="9" rx="4.5"/>
+    <rect x="27.5" y="34.5" width="9" height="16" rx="4.5"/>
+  </g>
+</svg>

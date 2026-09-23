@@ -19,6 +19,11 @@ pub fn run(repo: Repository) -> i32 {
 
     app.set_accels_for_action("win.refresh", &["<Primary>r"]);
     app.set_accels_for_action("app.quit", &["<Primary>q"]);
+    // Contextual hunk shortcuts: they act on the focused hunk (SPEC §30).
+    app.set_accels_for_action("win.stage-hunk", &["s"]);
+    app.set_accels_for_action("win.unstage-hunk", &["u"]);
+    app.set_accels_for_action("win.discard-hunk", &["d"]);
+    app.set_accels_for_action("win.revert-hunk", &["r"]);
     let quit = gio::SimpleAction::new("quit", None);
     {
         let app = app.clone();

@@ -30,6 +30,11 @@ impl Status {
     pub fn untracked_entries(&self) -> impl Iterator<Item = &StatusEntry> {
         self.entries.iter().filter(|entry| entry.is_untracked())
     }
+
+    /// Unmerged (conflicted) entries.
+    pub fn unmerged_entries(&self) -> impl Iterator<Item = &StatusEntry> {
+        self.entries.iter().filter(|entry| entry.is_unmerged())
+    }
 }
 
 /// Summary of HEAD as reported by `git status --branch`.

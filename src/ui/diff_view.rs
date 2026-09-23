@@ -14,7 +14,7 @@ use gtk4::prelude::*;
 use gtk4::{Align, Box as GtkBox, Button, Label, Orientation, TextBuffer, TextView, WrapMode};
 
 use crate::model::diff::{DiffLineKind, FileDiff, Hunk};
-use crate::ui::{DiffSide, display_name};
+use crate::ui::{DiffSide, HunkTarget, display_name};
 
 /// User actions available from the diff view.
 pub struct Callbacks {
@@ -27,6 +27,8 @@ pub struct Callbacks {
     pub discard_hunk: Box<dyn Fn(FileDiff, Hunk)>,
     /// Revert one hunk of a commit diff into the working tree (SPEC §18).
     pub revert_hunk: Box<dyn Fn(FileDiff, Hunk)>,
+    /// A hunk received keyboard focus (for the contextual shortcuts).
+    pub focus_hunk: Box<dyn Fn(HunkTarget)>,
     /// Stage every change of the given path.
     pub stage_file: Box<dyn Fn(PathBuf)>,
     /// Unstage every change of the given path.
@@ -130,8 +132,9 @@ fn file_header(file: &FileDiff, side: DiffSide, callbacks: &Rc<Callbacks>) -> gt
                 move || (callbacks.discard_file)(path.clone())
             }));
         }
-        // Historical commits get their actions in Fase 6 (Revert hunk).
-        DiffSide::History => {}
+        // Historical commits and conflicted files have no file actions: hunks
+        // get [Revert hunk], conflicted files are read-only (SPEC §§ 19, 31).
+        DiffSide::History | DiffSide::Conflicted => {}
     }
     header.upcast()
 }
@@ -144,6 +147,11 @@ fn hunk_view(
     callbacks: &Rc<Callbacks>,
 ) -> gtk4::Widget {
     let block = GtkBox::new(Orientation::Vertical, 4);
+    let target = HunkTarget {
+        file: file.clone(),
+        hunk: hunk.clone(),
+        side,
+    };
 
     let header = GtkBox::new(Orientation::Horizontal, 8);
     let header_label = Label::new(Some(&hunk.header_text()));
@@ -153,44 +161,102 @@ fn hunk_view(
     header_label.set_ellipsize(pango::EllipsizeMode::End);
     header_label.set_hexpand(true);
     header_label.set_selectable(true);
+    track_focus(&header_label, &target, callbacks);
     header.append(&header_label);
 
     match side {
         DiffSide::Staged => {
-            header.append(&file_button("Unstage", {
-                let file = file.clone();
-                let hunk = hunk.clone();
-                let callbacks = callbacks.clone();
-                move || (callbacks.unstage_hunk)(file.clone(), hunk.clone())
-            }));
+            push_hunk_button(
+                &header,
+                "Unstage",
+                "Unstage this hunk (U)",
+                &target,
+                callbacks,
+                {
+                    let callbacks = callbacks.clone();
+                    let file = file.clone();
+                    let hunk = hunk.clone();
+                    move || (callbacks.unstage_hunk)(file.clone(), hunk.clone())
+                },
+            );
         }
         DiffSide::Unstaged => {
-            header.append(&file_button("Stage", {
-                let file = file.clone();
-                let hunk = hunk.clone();
-                let callbacks = callbacks.clone();
-                move || (callbacks.stage_hunk)(file.clone(), hunk.clone())
-            }));
-            header.append(&file_button("Discard", {
-                let file = file.clone();
-                let hunk = hunk.clone();
-                let callbacks = callbacks.clone();
-                move || (callbacks.discard_hunk)(file.clone(), hunk.clone())
-            }));
+            push_hunk_button(
+                &header,
+                "Stage",
+                "Stage this hunk (S)",
+                &target,
+                callbacks,
+                {
+                    let callbacks = callbacks.clone();
+                    let file = file.clone();
+                    let hunk = hunk.clone();
+                    move || (callbacks.stage_hunk)(file.clone(), hunk.clone())
+                },
+            );
+            push_hunk_button(
+                &header,
+                "Discard",
+                "Discard this hunk (D)",
+                &target,
+                callbacks,
+                {
+                    let callbacks = callbacks.clone();
+                    let file = file.clone();
+                    let hunk = hunk.clone();
+                    move || (callbacks.discard_hunk)(file.clone(), hunk.clone())
+                },
+            );
         }
-        // Historical commits get their actions in Fase 6 (Revert hunk).
         DiffSide::History => {
-            header.append(&file_button("Revert hunk", {
-                let file = file.clone();
-                let hunk = hunk.clone();
-                let callbacks = callbacks.clone();
-                move || (callbacks.revert_hunk)(file.clone(), hunk.clone())
-            }));
+            push_hunk_button(
+                &header,
+                "Revert hunk",
+                "Revert this hunk (R)",
+                &target,
+                callbacks,
+                {
+                    let callbacks = callbacks.clone();
+                    let file = file.clone();
+                    let hunk = hunk.clone();
+                    move || (callbacks.revert_hunk)(file.clone(), hunk.clone())
+                },
+            );
         }
+        // Conflicted files are read-only (SPEC sections 25 and 31).
+        DiffSide::Conflicted => {}
     }
     block.append(&header);
-    block.append(&hunk_body(hunk));
+
+    let body = hunk_body(hunk);
+    track_focus(&body, &target, callbacks);
+    block.append(&body);
     block.upcast()
+}
+
+/// Appends an action button that reports its hunk when focused or clicked.
+fn push_hunk_button(
+    header: &GtkBox,
+    label: &str,
+    tooltip: &str,
+    target: &HunkTarget,
+    callbacks: &Rc<Callbacks>,
+    on_click: impl Fn() + 'static,
+) {
+    let button = file_button(label, on_click);
+    button.set_tooltip_text(Some(tooltip));
+    track_focus(&button, target, callbacks);
+    header.append(&button);
+}
+
+/// Reports `target` to the caller when `widget` gains keyboard focus, so the
+/// contextual shortcuts know which hunk to act on (SPEC section 30).
+fn track_focus(widget: &impl IsA<gtk4::Widget>, target: &HunkTarget, callbacks: &Rc<Callbacks>) {
+    let controller = gtk4::EventControllerFocus::new();
+    let callbacks = callbacks.clone();
+    let target = target.clone();
+    controller.connect_enter(move |_| (callbacks.focus_hunk)(target.clone()));
+    widget.add_controller(controller);
 }
 
 /// Monospace text view with the hunk lines and their line numbers.

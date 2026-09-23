@@ -121,6 +121,15 @@ impl ChangesView {
             );
         }
 
+        self.push_header("Conflicted");
+        items.push(None);
+        for entry in status.unmerged_entries() {
+            items.push(Some(Selection::Conflicted(entry.path.clone())));
+            // Conflict resolution is out of scope (SPEC sections 25 and 31):
+            // conflicted files are visible but read-only.
+            self.push_entry(entry, 'U', &[]);
+        }
+
         self.push_header("Untracked");
         items.push(None);
         for entry in status.untracked_entries() {

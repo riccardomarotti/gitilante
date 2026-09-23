@@ -1,0 +1,12 @@
+[Desktop Entry]
+Name=Gitilante
+GenericName=Git hunk viewer
+Comment=Lightweight Git GUI focused on reviewing changes and manipulating single hunks
+Exec=gitilante %f
+Icon=dev.gitilante.Gitilante
+Terminal=false
+Type=Application
+Categories=Development;RevisionControl;
+Keywords=git;diff;hunk;stage;review;revert;
+StartupNotify=true
+MimeType=inode/directory;
