@@ -1790,6 +1790,30 @@ impl Inner {
                 })
             },
             revert_hunk: op2_callback(&weak, Inner::revert_hunk),
+            stage_lines: {
+                let weak = weak.clone();
+                Box::new(move |file, hunk, selected| {
+                    if let Some(inner) = weak.upgrade() {
+                        inner.stage_lines(file, hunk, selected);
+                    }
+                })
+            },
+            unstage_lines: {
+                let weak = weak.clone();
+                Box::new(move |file, hunk, selected| {
+                    if let Some(inner) = weak.upgrade() {
+                        inner.unstage_lines(file, hunk, selected);
+                    }
+                })
+            },
+            discard_lines: {
+                let weak = weak.clone();
+                Box::new(move |file, hunk, selected| {
+                    if let Some(inner) = weak.upgrade() {
+                        inner.confirm_discard_lines(file, hunk, selected);
+                    }
+                })
+            },
             stage_file: op_callback(&weak, Inner::stage_file),
             unstage_file: op_callback(&weak, Inner::unstage_file),
             focus_hunk: op_callback(&weak, Inner::focus_hunk),
@@ -1872,6 +1896,22 @@ impl Inner {
         self.run_op(move |repo| repo.discard_hunk(&file, &hunk));
     }
 
+    fn stage_lines(&self, file: FileDiff, hunk: Hunk, selected: Vec<usize>) {
+        if !selected.is_empty() {
+            self.run_op(move |repo| repo.stage_lines(&file, &hunk, &selected));
+        }
+    }
+
+    fn unstage_lines(&self, file: FileDiff, hunk: Hunk, selected: Vec<usize>) {
+        if !selected.is_empty() {
+            self.run_op(move |repo| repo.unstage_lines(&file, &hunk, &selected));
+        }
+    }
+
+    fn discard_lines(&self, file: FileDiff, hunk: Hunk, selected: Vec<usize>) {
+        self.run_op(move |repo| repo.discard_lines(&file, &hunk, &selected));
+    }
+
     fn revert_hunk(&self, file: FileDiff, hunk: Hunk) {
         self.run_op(move |repo| repo.revert_commit_hunk(&file, &hunk));
     }
@@ -1933,6 +1973,16 @@ impl Inner {
     fn confirm_discard_hunk(&self, file: FileDiff, hunk: Hunk) {
         self.confirm_discard("Discard this hunk?", move |inner| {
             inner.discard_hunk(file, hunk);
+        });
+    }
+
+    fn confirm_discard_lines(&self, file: FileDiff, hunk: Hunk, selected: Vec<usize>) {
+        if selected.is_empty() {
+            return;
+        }
+        let heading = format!("Discard {} selected changed lines?", selected.len());
+        self.confirm_discard(&heading, move |inner| {
+            inner.discard_lines(file, hunk, selected);
         });
     }
 

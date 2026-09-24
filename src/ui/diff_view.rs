@@ -5,6 +5,7 @@
 //! hunk body in a monospace text view with line numbers. Additions and
 //! deletions keep their `+`/`-` markers and get a light background tint.
 
+use std::cell::RefCell;
 use std::path::PathBuf;
 use std::rc::Rc;
 
@@ -31,6 +32,10 @@ pub struct Callbacks {
     /// Discard one hunk of a working tree diff (the caller asks for
     /// confirmation first).
     pub discard_hunk: Box<dyn Fn(FileDiff, Hunk)>,
+    /// Operations on selected changed lines of one modified-file hunk.
+    pub stage_lines: Box<dyn Fn(FileDiff, Hunk, Vec<usize>)>,
+    pub unstage_lines: Box<dyn Fn(FileDiff, Hunk, Vec<usize>)>,
+    pub discard_lines: Box<dyn Fn(FileDiff, Hunk, Vec<usize>)>,
     /// Revert one hunk of a commit diff into the working tree (SPEC §18).
     pub revert_hunk: Box<dyn Fn(FileDiff, Hunk)>,
     /// A hunk received keyboard focus (for the contextual shortcuts).
@@ -515,8 +520,106 @@ fn hunk_view(
     let (body, mut search_target) = hunk_body(hunk, language, highlighter);
     search_target.hunk = Some(key);
     track_focus(&body, &target, callbacks);
+    if matches!(side, DiffSide::Staged | DiffSide::Unstaged)
+        && crate::git::patch::supports_selected_lines(file, hunk)
+    {
+        block.append(&selected_line_actions(
+            file,
+            hunk,
+            side,
+            &search_target.buffer,
+            callbacks,
+        ));
+    }
     block.append(&body);
     (block.upcast(), Some(search_target))
+}
+
+/// Maps a half-open GTK text selection to modified hunk-line indexes.
+fn selected_line_indexes(hunk: &Hunk, start: &gtk4::TextIter, end: &gtk4::TextIter) -> Vec<usize> {
+    selected_line_range(
+        hunk,
+        start.line().max(0) as usize,
+        end.line().max(0) as usize,
+        end.line_offset() as usize,
+    )
+}
+
+fn selected_line_range(
+    hunk: &Hunk,
+    first: usize,
+    end_line: usize,
+    end_column: usize,
+) -> Vec<usize> {
+    let last = end_line.saturating_add(usize::from(end_column > 0));
+    (first..last.min(hunk.lines.len()))
+        .filter(|&index| {
+            matches!(
+                hunk.lines[index].kind,
+                DiffLineKind::Addition | DiffLineKind::Deletion
+            )
+        })
+        .collect()
+}
+
+/// Contextual actions below the hunk header, visible only for changed lines.
+fn selected_line_actions(
+    file: &FileDiff,
+    hunk: &Hunk,
+    side: DiffSide,
+    buffer: &TextBuffer,
+    callbacks: &Rc<Callbacks>,
+) -> gtk4::Widget {
+    let row = GtkBox::new(Orientation::Horizontal, 8);
+    row.set_visible(false);
+    let count = Label::new(None);
+    count.set_hexpand(true);
+    count.set_xalign(0.0);
+    row.append(&count);
+    let selected = Rc::new(RefCell::new(Vec::new()));
+    let add_action = |label: &str| {
+        let file = file.clone();
+        let hunk = hunk.clone();
+        let selected = selected.clone();
+        let button = Button::with_label(label);
+        row.append(&button);
+        (button, file, hunk, selected)
+    };
+    match side {
+        DiffSide::Staged => {
+            let (button, file, hunk, selected) = add_action("Unstage selected");
+            let callbacks = callbacks.clone();
+            button.connect_clicked(move |_| {
+                (callbacks.unstage_lines)(file.clone(), hunk.clone(), selected.borrow().clone())
+            });
+        }
+        DiffSide::Unstaged => {
+            let (button, file, hunk, selected) = add_action("Stage selected");
+            let stage_callbacks = callbacks.clone();
+            button.connect_clicked(move |_| {
+                (stage_callbacks.stage_lines)(file.clone(), hunk.clone(), selected.borrow().clone())
+            });
+            let (button, file, hunk, selected) = add_action("Discard selected");
+            let callbacks = callbacks.clone();
+            button.connect_clicked(move |_| {
+                (callbacks.discard_lines)(file.clone(), hunk.clone(), selected.borrow().clone())
+            });
+        }
+        _ => unreachable!(),
+    }
+    let hunk = hunk.clone();
+    let row_for_selection = row.clone();
+    buffer.connect_mark_set(move |buffer, _, _| {
+        let indexes = buffer
+            .selection_bounds()
+            .map_or_else(Vec::new, |(start, end)| {
+                selected_line_indexes(&hunk, &start, &end)
+            });
+        count.set_text(&format!("{} changed lines selected", indexes.len()));
+        row_for_selection.set_visible(!indexes.is_empty());
+        *selected.borrow_mut() = indexes;
+    });
+    row.upcast()
 }
 
 /// Appends an action button that reports its hunk when focused or clicked.
@@ -820,4 +923,37 @@ pub(crate) fn new_tag_strong(buffer: &TextBuffer, background: gdk::RGBA) -> gtk4
     buffer
         .create_tag(None::<&str>, &[("background-rgba", &background)])
         .expect("create text tag")
+}
+
+#[cfg(test)]
+mod selected_line_tests {
+    use super::*;
+    use crate::model::diff::DiffLine;
+
+    #[test]
+    fn selection_end_at_next_line_start_excludes_that_line() {
+        let hunk = Hunk {
+            old_start: 1,
+            old_count: 2,
+            new_start: 1,
+            new_count: 2,
+            header: Vec::new(),
+            lines: [
+                DiffLineKind::Context,
+                DiffLineKind::Deletion,
+                DiffLineKind::Addition,
+                DiffLineKind::Context,
+            ]
+            .into_iter()
+            .map(|kind| DiffLine {
+                kind,
+                content: b"text".to_vec(),
+                intraline: Vec::new(),
+            })
+            .collect(),
+        };
+        assert_eq!(selected_line_range(&hunk, 0, 2, 0), vec![1]);
+        assert_eq!(selected_line_range(&hunk, 1, 2, 1), vec![1, 2]);
+        assert!(selected_line_range(&hunk, 0, 1, 0).is_empty());
+    }
 }

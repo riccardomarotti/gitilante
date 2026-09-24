@@ -163,6 +163,24 @@ impl Repository {
         )
     }
 
+    /// Stages only the selected changed lines of a modified file.
+    pub fn stage_lines(&self, file: &FileDiff, hunk: &Hunk, selected: &[usize]) -> Result<()> {
+        let patch = patch::selected_lines_patch(file, hunk, selected)?;
+        patch::apply(&self.root, &patch, ApplyTarget::Index, false)
+    }
+
+    /// Removes only the selected changed lines from the index.
+    pub fn unstage_lines(&self, file: &FileDiff, hunk: &Hunk, selected: &[usize]) -> Result<()> {
+        let patch = patch::selected_lines_patch_for_direction(file, hunk, selected, true)?;
+        patch::apply(&self.root, &patch, ApplyTarget::Index, true)
+    }
+
+    /// Discards only the selected changed lines from the working tree.
+    pub fn discard_lines(&self, file: &FileDiff, hunk: &Hunk, selected: &[usize]) -> Result<()> {
+        let patch = patch::selected_lines_patch_for_direction(file, hunk, selected, true)?;
+        patch::apply(&self.root, &patch, ApplyTarget::WorkTree, true)
+    }
+
     /// Reverts a single hunk of a commit diff into the working tree (SPEC §18).
     ///
     /// The inverse of the change introduced by the commit is applied to the

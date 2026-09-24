@@ -51,6 +51,8 @@ pub enum Error {
     /// A patch (or its reverse) no longer applies cleanly: the repository
     /// changed after the diff it was built from was read.
     PatchDoesNotApply { stderr: String },
+    /// A selected-line patch cannot be built from these indexes or this file.
+    InvalidLineSelection,
     /// A historical hunk cannot be reverted cleanly: the file has diverged
     /// since its commit (SPEC section 18).
     HunkCannotBeReverted { stderr: String },
@@ -72,6 +74,7 @@ impl fmt::Display for Error {
                     "This hunk can no longer be applied because the file has changed.\n\n{stderr}"
                 )
             }
+            Self::InvalidLineSelection => write!(f, "Cannot apply selected lines from this diff."),
             Self::HunkCannotBeReverted { stderr } => {
                 write!(
                     f,
