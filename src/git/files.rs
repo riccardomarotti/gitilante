@@ -21,6 +21,16 @@ pub fn working_tree_files(repo: &Repository) -> Result<Vec<PathBuf>> {
     Ok(parse(&output.stdout))
 }
 
+/// Lists only the untracked, non-ignored files for the Contents scan
+/// (GITILANTE_SEARCH_SPEC.md section 19).
+pub fn untracked_files(repo: &Repository) -> Result<Vec<PathBuf>> {
+    let output = command::run(
+        repo.root(),
+        &["ls-files", "--others", "--exclude-standard", "-z"],
+    )?;
+    Ok(parse(&output.stdout))
+}
+
 /// Parses the NUL-delimited file list (GITILANTE_SEARCH_SPEC.md section 54).
 pub fn parse(input: &[u8]) -> Vec<PathBuf> {
     input

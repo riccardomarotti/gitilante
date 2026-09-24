@@ -7,6 +7,7 @@ pub mod command;
 pub mod diff;
 pub mod error;
 pub mod files;
+pub mod grep;
 pub mod history;
 pub mod patch;
 pub mod refs;

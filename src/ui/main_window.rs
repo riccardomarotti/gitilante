@@ -26,7 +26,7 @@ use crate::model::refs::{CommitRef, HeadRef};
 use crate::model::status::{Status, StatusEntry};
 use crate::search::SearchQuery;
 use crate::search::SearchScope;
-use crate::search::result::{ChangeSearchResult, SearchResult};
+use crate::search::result::{ChangeSearchResult, MatchRange, SearchResult};
 use crate::ui::worker::Worker;
 use crate::ui::{
     DiffSide, HunkTarget, Selection, changes, diff_view, history, search, search_dialog, short_path,
@@ -75,6 +75,8 @@ struct State {
     /// Content of the selected file preview, loaded lazily
     /// (GITILANTE_SEARCH_SPEC.md section 16).
     file_preview: Option<(PathBuf, Result<Vec<u8>, String>)>,
+    /// Match ranges to flash once the preview is rendered (section 22).
+    preview_flash: Option<Vec<MatchRange>>,
     /// Bumped on every selection change; stale commit diffs are dropped.
     commit_diff_generation: u64,
     /// Hunk that has keyboard focus, target of the contextual shortcuts.
@@ -583,6 +585,9 @@ impl Inner {
                 .is_some_and(|(cached, _)| cached == path),
             _ => true,
         };
+        if !matches!(selection, Selection::FilePreview { .. }) {
+            state.preview_flash = None;
+        }
         state.selection = Some(selection.clone());
         drop(state);
 
@@ -661,6 +666,10 @@ impl Inner {
                         results.extend(crate::search::files::search(&query, &files));
                     }
                 }
+                if matches!(query.scope, SearchScope::All | SearchScope::Contents) {
+                    let untracked = repo.untracked_files().unwrap_or_default();
+                    results.extend(crate::search::contents::search(&query, &repo, &untracked));
+                }
                 results
             },
             move |results| {
@@ -678,15 +687,24 @@ impl Inner {
     fn activate_search_result(&self, result: SearchResult) {
         match result {
             SearchResult::Change(change) => self.navigate_to_change(&change),
-            SearchResult::File(file) => self.navigate_to_file(&file.path, None),
+            SearchResult::File(file) => self.navigate_to_file(&file.path, None, &[]),
+            SearchResult::Content(content) => self.navigate_to_file(
+                &content.path,
+                Some(content.line_number),
+                &content.match_ranges,
+            ),
             // The other providers arrive with their phases.
             _ => {}
         }
     }
 
     /// Opens the read-only preview of a file (GITILANTE_SEARCH_SPEC.md §16).
-    fn navigate_to_file(&self, path: &Path, line: Option<usize>) {
+    fn navigate_to_file(&self, path: &Path, line: Option<usize>, ranges: &[MatchRange]) {
         self.search_dialog.close();
+        {
+            let mut state = self.state.borrow_mut();
+            state.preview_flash = (!ranges.is_empty()).then(|| ranges.to_vec());
+        }
         self.select(Selection::FilePreview {
             path: path.to_path_buf(),
             line,
@@ -800,6 +818,9 @@ impl Inner {
             self.diff_box.remove(&child);
         }
 
+        // Taken before the match: the pending flash belongs to this render
+        // (GITILANTE_SEARCH_SPEC.md section 22).
+        let mut flash = state.preview_flash.take();
         let rendered = match &state.selection {
             None => diff_view::RenderedDiff::plain(diff_view::placeholder(
                 "Select a file to see its diff",
@@ -825,7 +846,7 @@ impl Inner {
             },
             Some(Selection::FilePreview { path, line }) => match &state.file_preview {
                 Some((cached, content)) if cached == path => match content {
-                    Ok(bytes) => self.render_file_preview(path, bytes, *line),
+                    Ok(bytes) => self.render_file_preview(path, bytes, *line, flash.take()),
                     Err(_) => diff_view::RenderedDiff::plain(diff_view::placeholder(
                         "Cannot read this file",
                     )),
@@ -839,6 +860,10 @@ impl Inner {
         state.render_targets = rendered.targets.clone();
         self.search_bar.set_targets(rendered.targets);
         self.diff_scroll.vadjustment().set_value(0.0);
+        // A flash not consumed by a preview render stays pending.
+        if flash.is_some() {
+            state.preview_flash = flash;
+        }
     }
 
     fn render_file_diff(
@@ -861,6 +886,7 @@ impl Inner {
         path: &Path,
         bytes: &[u8],
         line: Option<usize>,
+        flash: Option<Vec<MatchRange>>,
     ) -> diff_view::RenderedDiff {
         // Binary files have no textual preview.
         if bytes.iter().take(8192).any(|byte| *byte == 0) {
@@ -868,15 +894,40 @@ impl Inner {
         }
         let content = String::from_utf8_lossy(bytes);
         let rendered = diff_view::render_file_preview(path, &content, &self.highlighter);
-        // Reveal the requested line (GITILANTE_SEARCH_SPEC.md section 22).
-        if let Some(line) = line {
-            if let Some(target) = rendered.targets.first() {
-                if let Some(iter) = target
-                    .buffer
-                    .iter_at_line_offset((line.saturating_sub(1)) as i32, 0)
-                {
-                    search::reveal_iter(&self.diff_scroll, target, &iter);
+        // Reveal the requested line and flash its matches
+        // (GITILANTE_SEARCH_SPEC.md section 22).
+        if let (Some(line), Some(target)) = (line, rendered.targets.first()) {
+            if let Some(iter) = target
+                .buffer
+                .iter_at_line_offset((line.saturating_sub(1)) as i32, 0)
+            {
+                search::reveal_iter(&self.diff_scroll, target, &iter);
+            }
+            if let Some(ranges) = flash {
+                let flash_tag = search::flash_tag(&target.buffer);
+                for range in ranges {
+                    let (Some(start), Some(end)) = (
+                        target.buffer.iter_at_line_offset(
+                            (line.saturating_sub(1)) as i32,
+                            range.start as i32,
+                        ),
+                        target
+                            .buffer
+                            .iter_at_line_offset((line.saturating_sub(1)) as i32, range.end as i32),
+                    ) else {
+                        continue;
+                    };
+                    target.buffer.apply_tag(&flash_tag, &start, &end);
                 }
+                let buffer = target.buffer.clone();
+                gtk4::glib::timeout_add_local_once(
+                    std::time::Duration::from_millis(1400),
+                    move || {
+                        let start = buffer.start_iter();
+                        let end = buffer.end_iter();
+                        buffer.remove_tag(&flash_tag, &start, &end);
+                    },
+                );
             }
         }
         rendered

@@ -6,6 +6,7 @@
 //! or run through the worker (GITILANTE_SEARCH_SPEC.md section 52).
 
 pub mod changes;
+pub mod contents;
 pub mod files;
 pub mod matcher;
 pub mod query;

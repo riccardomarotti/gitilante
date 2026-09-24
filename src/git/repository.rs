@@ -113,6 +113,11 @@ impl Repository {
         crate::git::files::working_tree_files(self)
     }
 
+    /// Only the untracked, non-ignored files (GITILANTE_SEARCH_SPEC.md §19).
+    pub fn untracked_files(&self) -> Result<Vec<PathBuf>> {
+        crate::git::files::untracked_files(self)
+    }
+
     /// Diff of a single commit (SPEC §17).
     pub fn commit_diff(&self, oid: &str) -> Result<Diff> {
         enrich(crate::git::history::commit_diff(self, oid))
