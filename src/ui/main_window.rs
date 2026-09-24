@@ -90,6 +90,8 @@ struct Inner {
     history_view: history::HistoryView,
     diff_box: GtkBox,
     diff_scroll: ScrolledWindow,
+    /// Sidebar scroll, anchored across History rebuilds.
+    sidebar_adjustment: Adjustment,
 }
 
 /// The Gitilante main window.
@@ -281,6 +283,7 @@ impl Inner {
             history_view,
             diff_box,
             diff_scroll,
+            sidebar_adjustment: sidebar_scroll.vadjustment(),
         }
     }
 
@@ -529,6 +532,10 @@ impl Inner {
         // (BRANCH.md section 53).
         let graph = crate::graph::layout_commits(&commits);
         let dark = adw::StyleManager::default().is_dark();
+        // Rebuilding the rows must not move the viewport: anchor it to its
+        // current position (BRANCH.md section 57).
+        let adjustment = self.sidebar_adjustment.clone();
+        let anchor = adjustment.value();
         self.history_view.update(
             &commits,
             &graph,
@@ -539,6 +546,9 @@ impl Inner {
             loading,
             exhausted,
         );
+        gtk4::glib::idle_add_local_once(move || {
+            adjustment.set_value(anchor);
+        });
     }
 
     /// Rebuilds the diff pane for the current selection.
