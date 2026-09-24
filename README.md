@@ -1,5 +1,7 @@
 # Gitilante
 
+![Gitilante](screenshot.png)
+
 A lightweight open source Git GUI, focused on the operations that are more
 convenient in a graphical interface than in a terminal: reviewing the current
 changes and manipulating single hunks.
