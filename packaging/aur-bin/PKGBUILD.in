@@ -17,6 +17,7 @@ depends=(
     'gtksourceview5'
     'libadwaita'
 )
+optdepends=('git-lfs: for repositories using Git LFS')
 provides=("gitilante=$pkgver")
 conflicts=('gitilante')
 source=(
