@@ -649,6 +649,18 @@ impl Inner {
     /// Runs the global search on the worker thread
     /// (GITILANTE_SEARCH_SPEC.md sections 52-53).
     fn run_search(&self, query: SearchQuery) {
+        // An invalid pattern reports before any provider runs (section 38).
+        if let Err(message) = crate::search::matcher::validate(&query) {
+            self.search_dialog.show_error(&message);
+            return;
+        }
+        if cfg!(debug_assertions) {
+            // Debug telemetry (GITILANTE_SEARCH_SPEC.md section 75).
+            eprintln!(
+                "[search] scope={:?} query={:?} regex={}",
+                query.scope, query.text, query.regex
+            );
+        }
         let generation = self.search_generation.get() + 1;
         self.search_generation.set(generation);
         let (worktree, staged) = {

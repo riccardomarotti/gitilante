@@ -66,9 +66,81 @@ pub fn find_matches(text: &str, query: &str, case_sensitive: bool) -> Vec<(usize
     matches
 }
 
+/// Validates a query pattern before the providers run
+/// (GITILANTE_SEARCH_SPEC.md section 38).
+pub fn validate(query: &crate::search::query::SearchQuery) -> Result<(), String> {
+    if query.regex {
+        build_regex(&query.text, query.is_case_sensitive()).map(|_| ())
+    } else {
+        Ok(())
+    }
+}
+
+/// Finds matches of the query, fixed-string or regular expression
+/// (GITILANTE_SEARCH_SPEC.md section 49).
+pub fn find_matches_auto(
+    text: &str,
+    query: &crate::search::query::SearchQuery,
+) -> Result<Vec<(usize, usize)>, String> {
+    if query.regex {
+        find_matches_regex(text, &query.text, query.is_case_sensitive())
+    } else {
+        Ok(find_matches(text, &query.text, query.is_case_sensitive()))
+    }
+}
+
+/// Regex matching with character offsets: the regex crate speaks bytes, GTK
+/// speaks characters (GITILANTE_SEARCH_SPEC.md section 40).
+pub fn find_matches_regex(
+    text: &str,
+    pattern: &str,
+    case_sensitive: bool,
+) -> Result<Vec<(usize, usize)>, String> {
+    let regex = build_regex(pattern, case_sensitive)?;
+    Ok(regex
+        .find_iter(text)
+        .filter(|found| found.start() < found.end())
+        .map(|found| {
+            (
+                text[..found.start()].chars().count(),
+                text[..found.end()].chars().count(),
+            )
+        })
+        .collect())
+}
+
+fn build_regex(pattern: &str, case_sensitive: bool) -> Result<regex::Regex, String> {
+    regex::RegexBuilder::new(pattern)
+        .case_insensitive(!case_sensitive)
+        .build()
+        .map_err(|error| error.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn regex_matches_keep_character_offsets() {
+        // GITILANTE_SEARCH_SPEC.md sections 40 and 49.
+        let found = find_matches_regex("città 42, café 7", r"\d+", true).unwrap();
+        assert_eq!(found, vec![(6, 8), (15, 16)]);
+        let found = find_matches_regex("😀 value = 42", r"value = \d+", true).unwrap();
+        assert_eq!(found, vec![(2, 12)]);
+    }
+
+    #[test]
+    fn invalid_regex_reports_an_error() {
+        assert!(find_matches_regex("text", "[invalid(", true).is_err());
+    }
+
+    #[test]
+    fn regex_respects_the_case_mode() {
+        let found = find_matches_regex("Value value", r"value", false).unwrap();
+        assert_eq!(found, vec![(0, 5), (6, 11)]);
+        let found = find_matches_regex("Value value", r"value", true).unwrap();
+        assert_eq!(found, vec![(6, 11)]);
+    }
 
     #[test]
     fn finds_plain_matches() {

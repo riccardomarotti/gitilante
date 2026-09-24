@@ -15,9 +15,11 @@ use std::rc::Rc;
 use gtk4::gdk::{self, Key};
 use gtk4::pango;
 use gtk4::prelude::*;
-use gtk4::{Box as GtkBox, Button, Label, Orientation, ScrolledWindow, SearchEntry, TextTag};
+use gtk4::{
+    Box as GtkBox, Button, Label, Orientation, ScrolledWindow, SearchEntry, TextTag, ToggleButton,
+};
 
-use crate::search::matcher::{find_matches, is_case_sensitive};
+use crate::search::matcher::{find_matches, find_matches_regex, is_case_sensitive};
 use crate::ui::diff_view::SearchTarget;
 
 /// Background of a non-active search match.
@@ -54,6 +56,8 @@ struct Shared {
     matches: RefCell<Vec<MatchLoc>>,
     active: Cell<usize>,
     query: RefCell<String>,
+    /// Regular expression mode (GITILANTE_SEARCH_SPEC.md section 49).
+    regex: Cell<bool>,
     /// Told when the bar gains/loses the keyboard focus.
     on_focus: Box<dyn Fn(bool)>,
 }
@@ -83,6 +87,10 @@ impl SearchBar {
         entry.set_placeholder_text(Some("Search in current view…"));
         root.append(&entry);
 
+        let regex_toggle = ToggleButton::with_label(".*");
+        regex_toggle.set_tooltip_text(Some("Regular expression"));
+        root.append(&regex_toggle);
+
         let counter = Label::new(None);
         counter.add_css_class("dim-label");
         counter.add_css_class("monospace");
@@ -106,8 +114,17 @@ impl SearchBar {
             matches: RefCell::new(Vec::new()),
             active: Cell::new(0),
             query: RefCell::new(String::new()),
+            regex: Cell::new(false),
             on_focus,
         });
+
+        {
+            let shared = shared.clone();
+            regex_toggle.connect_toggled(move |button| {
+                shared.regex.set(button.is_active());
+                refresh(&shared);
+            });
+        }
 
         {
             let shared = shared.clone();
@@ -228,16 +245,30 @@ fn refresh(shared: &Rc<Shared>) {
     let case_sensitive = is_case_sensitive(&query);
 
     let mut matches = Vec::new();
+    let mut error = None;
     if !query.is_empty() {
         let targets = shared.targets.borrow();
         for (index, state) in targets.iter().enumerate() {
             let text = buffer_text(&state.target);
-            for (start, end) in find_matches(&text, &query, case_sensitive) {
-                matches.push(MatchLoc {
-                    target: index,
-                    start: start as i32,
-                    end: end as i32,
-                });
+            let found = if shared.regex.get() {
+                find_matches_regex(&text, &query, case_sensitive)
+            } else {
+                Ok(find_matches(&text, &query, case_sensitive))
+            };
+            match found {
+                Ok(ranges) => {
+                    for (start, end) in ranges {
+                        matches.push(MatchLoc {
+                            target: index,
+                            start: start as i32,
+                            end: end as i32,
+                        });
+                    }
+                }
+                Err(message) => {
+                    error = Some(message);
+                    break;
+                }
             }
         }
     }
@@ -246,7 +277,14 @@ fn refresh(shared: &Rc<Shared>) {
     let total = matches.len();
     *shared.matches.borrow_mut() = matches;
     reapply(shared);
-    set_counter(shared, total);
+    if let Some(message) = error {
+        // A contextual error near the field (section 38).
+        shared.counter.set_text("invalid regex");
+        shared.counter.set_tooltip_text(Some(&message));
+    } else {
+        shared.counter.set_tooltip_text(None);
+        set_counter(shared, total);
+    }
     reveal(shared);
 }
 

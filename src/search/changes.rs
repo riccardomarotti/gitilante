@@ -6,7 +6,7 @@
 
 use crate::model::diff::{Diff, DiffLineKind};
 use crate::search::SEARCH_RESULTS_PER_PROVIDER;
-use crate::search::matcher::find_matches;
+use crate::search::matcher::find_matches_auto;
 use crate::search::query::{ChangeFilter, SearchQuery};
 use crate::search::result::{ChangeSearchResult, MatchRange, SearchResult};
 use crate::ui::DiffSide;
@@ -26,7 +26,6 @@ fn collect(query: &SearchQuery, diff: &Diff, side: DiffSide, results: &mut Vec<S
     if results.len() >= SEARCH_RESULTS_PER_PROVIDER {
         return;
     }
-    let case_sensitive = query.is_case_sensitive();
     for file in &diff.files {
         for (hunk_index, hunk) in file.hunks.iter().enumerate() {
             for (line_index, line) in hunk.lines.iter().enumerate() {
@@ -37,7 +36,8 @@ fn collect(query: &SearchQuery, diff: &Diff, side: DiffSide, results: &mut Vec<S
                     continue;
                 }
                 let snippet = line.text().into_owned();
-                let ranges: Vec<MatchRange> = find_matches(&snippet, &query.text, case_sensitive)
+                let ranges: Vec<MatchRange> = find_matches_auto(&snippet, query)
+                    .unwrap_or_default()
                     .into_iter()
                     .map(|(start, end)| MatchRange { start, end })
                     .collect();

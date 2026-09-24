@@ -393,6 +393,7 @@ dependencies = [
  "gtk4",
  "libadwaita",
  "log",
+ "regex",
  "sourceview5",
  "unicode-segmentation",
 ]

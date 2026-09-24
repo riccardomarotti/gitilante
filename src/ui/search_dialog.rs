@@ -13,14 +13,14 @@ use std::time::Duration;
 use gtk4::gdk::Key;
 use gtk4::prelude::*;
 use gtk4::{
-    Box as GtkBox, Label, ListBox, ListBoxRow, Orientation, ScrolledWindow, SearchEntry,
+    Box as GtkBox, Button, Label, ListBox, ListBoxRow, Orientation, ScrolledWindow, SearchEntry,
     ToggleButton,
 };
 use libadwaita as adw;
 use libadwaita::prelude::AdwDialogExt;
 
 use crate::search::result::{MatchRange, SearchResult};
-use crate::search::{ChangeFilter, SearchQuery, SearchScope};
+use crate::search::{CaseMode, ChangeFilter, SearchQuery, SearchScope};
 
 /// Delay between the last keystroke and the search (section 33).
 const SEARCH_DEBOUNCE: Duration = Duration::from_millis(200);
@@ -72,6 +72,16 @@ impl SearchDialog {
         let entry = SearchEntry::new();
         entry.set_placeholder_text(Some("Search repository…"));
         content.append(&entry);
+
+        // Matching options (GITILANTE_SEARCH_SPEC.md sections 8 and 49).
+        let options = GtkBox::new(Orientation::Horizontal, 6);
+        let regex_toggle = ToggleButton::with_label(".*");
+        regex_toggle.set_tooltip_text(Some("Regular expression"));
+        options.append(&regex_toggle);
+        let case_button = Button::with_label("Aa");
+        case_button.set_tooltip_text(Some("Smart case — click to change"));
+        options.append(&case_button);
+        content.append(&options);
 
         // Scope row (section 2). History arrives with its providers
         // (GITILANTE_SEARCH_SPEC.md sections 79).
@@ -163,6 +173,33 @@ impl SearchDialog {
         }
 
         // Scope and filter changes run immediately.
+        {
+            let shared = shared.clone();
+            regex_toggle.connect_toggled(move |button| {
+                shared.query.borrow_mut().regex = button.is_active();
+                run_search(&shared);
+            });
+        }
+        {
+            let shared = shared.clone();
+            case_button.connect_clicked(move |button| {
+                let mode = {
+                    let mut query = shared.query.borrow_mut();
+                    query.case_mode = match query.case_mode {
+                        CaseMode::Smart => CaseMode::Sensitive,
+                        CaseMode::Sensitive => CaseMode::Insensitive,
+                        CaseMode::Insensitive => CaseMode::Smart,
+                    };
+                    query.case_mode
+                };
+                button.set_tooltip_text(Some(match mode {
+                    CaseMode::Smart => "Smart case — click to change",
+                    CaseMode::Sensitive => "Match case — click to change",
+                    CaseMode::Insensitive => "Ignore case — click to change",
+                }));
+                run_search(&shared);
+            });
+        }
         {
             let shared = shared.clone();
             scope_all.connect_toggled(move |button| {

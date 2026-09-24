@@ -28,18 +28,28 @@ pub struct GrepMatch {
     pub text: String,
 }
 
-/// Searches the tracked files of the working tree with `git grep -F`.
+/// Searches the tracked files of the working tree with `git grep`.
 ///
-/// Fixed-string matching only (GITILANTE_SEARCH_SPEC.md sections 18 and 49).
-/// Exit code 1 means "no matches": a result, not an error.
-pub fn grep(repo: &Repository, query: &str, case_sensitive: bool) -> Result<Vec<GrepMatch>> {
+/// Fixed-string matching by default, extended regular expressions when asked
+/// (GITILANTE_SEARCH_SPEC.md sections 18 and 49). Exit code 1 means "no
+/// matches": a result, not an error.
+pub fn grep(
+    repo: &Repository,
+    query: &str,
+    case_sensitive: bool,
+    regex: bool,
+) -> Result<Vec<GrepMatch>> {
     let mut args = vec![
         "grep".to_owned(),
         "-z".to_owned(),
         "-n".to_owned(),
         "--column".to_owned(),
         "-I".to_owned(),
-        "-F".to_owned(),
+        if regex {
+            "-E".to_owned()
+        } else {
+            "-F".to_owned()
+        },
     ];
     if !case_sensitive {
         args.push("-i".to_owned());
