@@ -18,7 +18,10 @@ use gtk4::{Adjustment, Box as GtkBox, Button, Orientation, Paned, PolicyType, Sc
 use libadwaita as adw;
 use libadwaita::prelude::*;
 
+use crate::conflict::presentation::ConflictPresentation;
+use crate::conflict::resolution::ConflictResolution;
 use crate::git::Error;
+use crate::git::conflict::ConflictLoad;
 use crate::git::repository::Repository;
 use crate::model::commit::Commit;
 use crate::model::diff::{Diff, FileDiff, Hunk};
@@ -31,8 +34,8 @@ use crate::search::result::{
 };
 use crate::ui::worker::Worker;
 use crate::ui::{
-    DiffSide, HunkTarget, Selection, changes, diff_view, folding, history, search, search_dialog,
-    short_path,
+    DiffSide, HunkTarget, Selection, changes, conflict_view, diff_view, folding, history, search,
+    search_dialog, short_path,
 };
 
 /// Commits per history block (SPEC section 16).
@@ -88,6 +91,10 @@ struct State {
     current_hunk: Option<HunkTarget>,
     /// Searchable text of the currently rendered diff (section 3).
     render_targets: Vec<crate::ui::diff_view::SearchTarget>,
+    /// Conflict solver sessions, kept while each conflict stays valid (§60-61).
+    conflict_sessions: HashMap<PathBuf, Rc<RefCell<conflict_view::ConflictSession>>>,
+    /// Load failures of the conflict solver, keyed by path.
+    conflict_errors: HashMap<PathBuf, String>,
 }
 
 struct Inner {
@@ -551,17 +558,34 @@ impl Inner {
             }
             match result {
                 Ok(data) => {
-                    let selection = state
-                        .selection
+                    let previous = state.selection.clone();
+                    // A solver session survives only while its conflict is
+                    // unchanged: same file, same stages (§61).
+                    state.conflict_sessions.retain(|path, session| {
+                        data.status
+                            .entries
+                            .iter()
+                            .find(|entry| &entry.path == path)
+                            .and_then(|entry| entry.unmerged())
+                            .is_some_and(|info| *info == session.borrow().load.unmerged)
+                    });
+                    let selection = previous
                         .clone()
                         .filter(|selection| selection_exists(&data.status, selection));
-                    state.data = Some(data);
+                    // After a resolution, the next conflict is selected (§63).
+                    let next_conflict = if matches!(previous, Some(Selection::Conflicted(_))) {
+                        data.status
+                            .unmerged_entries()
+                            .next()
+                            .map(|entry| Selection::Conflicted(entry.path.clone()))
+                    } else {
+                        None
+                    };
                     // Show a diff right away: when nothing is selected (startup
                     // or a selection that vanished), pick the first entry.
-                    state.selection = selection.or_else(|| {
-                        let data = state.data.as_ref().expect("just set");
-                        first_selection(&data.status)
-                    });
+                    let first = first_selection(&data.status);
+                    state.data = Some(data);
+                    state.selection = selection.or(next_conflict).or(first);
                 }
                 Err(error) => {
                     drop(state);
@@ -572,6 +596,21 @@ impl Inner {
         }
         self.render_changes();
         self.render_diff();
+        // Open the solver when a selected conflict has no session yet (§58).
+        let pending_conflict = {
+            let state = self.state.borrow();
+            match &state.selection {
+                Some(Selection::Conflicted(path))
+                    if !state.conflict_sessions.contains_key(path) =>
+                {
+                    Some((state.commit_diff_generation, path.clone()))
+                }
+                _ => None,
+            }
+        };
+        if let Some((generation, path)) = pending_conflict {
+            self.load_conflict(generation, path);
+        }
         let (root, status) = {
             let state = self.state.borrow();
             let data = state.data.as_ref().expect("refresh just set it");
@@ -635,6 +674,7 @@ impl Inner {
                 .file_preview
                 .as_ref()
                 .is_some_and(|(cached, _)| cached == path),
+            Selection::Conflicted(path) => state.conflict_sessions.contains_key(path),
             _ => true,
         };
         if !matches!(selection, Selection::FilePreview { .. }) {
@@ -648,6 +688,7 @@ impl Inner {
             match selection {
                 Selection::Commit(oid) => self.load_commit_diff(generation, oid),
                 Selection::FilePreview { path, .. } => self.load_file_preview(generation, path),
+                Selection::Conflicted(path) => self.load_conflict(generation, path),
                 _ => {}
             }
         }
@@ -689,6 +730,288 @@ impl Inner {
         });
         drop(state);
         self.render_diff();
+    }
+
+    // --- conflict solver (docs/GITILANTE_CONFLICT_SOLVER_SPEC.md) -------
+
+    /// Loads one conflict into a solver session (§58).
+    fn load_conflict(&self, generation: u64, path: PathBuf) {
+        self.busy_start();
+        let repo = self.repo.clone();
+        let weak = self.self_weak.clone();
+        self.worker.run(
+            move || match repo.conflict(&path) {
+                Ok(loaded) => Ok((path.clone(), loaded)),
+                Err(error) => Err((path.clone(), error)),
+            },
+            move |result| {
+                if let Some(inner) = weak.upgrade() {
+                    inner.finish_conflict(generation, result);
+                }
+            },
+        );
+    }
+
+    /// Stores a loaded conflict unless a newer selection superseded it (§59).
+    fn finish_conflict(
+        &self,
+        generation: u64,
+        result: Result<(PathBuf, Option<ConflictLoad>), (PathBuf, Error)>,
+    ) {
+        self.busy_finish();
+        let mut state = self.state.borrow_mut();
+        if state.commit_diff_generation != generation {
+            return; // stale result (§59)
+        }
+        match result {
+            Ok((path, Some(load))) => {
+                state.conflict_errors.remove(&path);
+                state.conflict_sessions.insert(
+                    path.clone(),
+                    Rc::new(RefCell::new(conflict_view::ConflictSession::new(
+                        path, load,
+                    ))),
+                );
+            }
+            Ok((path, None)) => {
+                state.conflict_sessions.remove(&path);
+            }
+            Err((path, error)) => {
+                state.conflict_errors.insert(path, error.to_string());
+                drop(state);
+                self.show_error(&error);
+                self.render_diff();
+                return;
+            }
+        }
+        drop(state);
+        self.render_diff();
+    }
+
+    /// Runs `action` on the session of the selected conflict (§60).
+    fn with_current_session(&self, action: impl FnOnce(&mut conflict_view::ConflictSession)) {
+        let state = self.state.borrow();
+        if let Some(Selection::Conflicted(path)) = &state.selection {
+            if let Some(session) = state.conflict_sessions.get(path) {
+                action(&mut session.borrow_mut());
+            }
+        }
+    }
+
+    /// Callbacks of the conflict solver.
+    fn conflict_callbacks(&self) -> Rc<conflict_view::Callbacks> {
+        let choose = {
+            let weak = self.self_weak.clone();
+            Box::new(move |index: usize, resolution: ConflictResolution| {
+                if let Some(inner) = weak.upgrade() {
+                    inner.with_current_session(|session| {
+                        session.resolutions[index] = resolution;
+                    });
+                }
+            })
+        };
+        let reset = {
+            let weak = self.self_weak.clone();
+            Box::new(move |index: usize| {
+                if let Some(inner) = weak.upgrade() {
+                    inner.with_current_session(|session| {
+                        session.resolutions[index] = ConflictResolution::Unresolved;
+                    });
+                }
+            })
+        };
+        let toggle_collapse = {
+            let weak = self.self_weak.clone();
+            Box::new(move |index: usize| {
+                if let Some(inner) = weak.upgrade() {
+                    inner.with_current_session(|session| {
+                        session.collapsed[index] = !session.collapsed[index];
+                    });
+                }
+            })
+        };
+        let toggle_base = {
+            let weak = self.self_weak.clone();
+            Box::new(move |index: usize| {
+                if let Some(inner) = weak.upgrade() {
+                    inner.with_current_session(|session| {
+                        session.base_visible[index] = !session.base_visible[index];
+                    });
+                }
+            })
+        };
+        let choose_file = {
+            let weak = self.self_weak.clone();
+            Box::new(move |choice: conflict_view::FileChoice| {
+                if let Some(inner) = weak.upgrade() {
+                    inner.with_current_session(|session| session.file_choice = choice);
+                }
+            })
+        };
+        let apply = {
+            let weak = self.self_weak.clone();
+            Box::new(move || {
+                if let Some(inner) = weak.upgrade() {
+                    inner.apply_conflict();
+                }
+            })
+        };
+        let mark_resolved = {
+            let weak = self.self_weak.clone();
+            Box::new(move || {
+                if let Some(inner) = weak.upgrade() {
+                    inner.mark_conflict_resolved();
+                }
+            })
+        };
+        let refresh = {
+            let weak = self.self_weak.clone();
+            Box::new(move || {
+                if let Some(inner) = weak.upgrade() {
+                    inner.refresh_conflict();
+                }
+            })
+        };
+        Rc::new(conflict_view::Callbacks {
+            choose,
+            reset,
+            toggle_collapse,
+            toggle_base,
+            choose_file,
+            apply,
+            mark_resolved,
+            refresh,
+        })
+    }
+
+    /// Applies the resolution: writes the file and stages it (§43-44).
+    fn apply_conflict(&self) {
+        enum Outcome {
+            Write(Vec<u8>),
+            Stage,
+            Delete,
+        }
+        let prepared = {
+            let state = self.state.borrow();
+            let Some(Selection::Conflicted(path)) = state.selection.clone() else {
+                return;
+            };
+            let Some(session) = state.conflict_sessions.get(&path).cloned() else {
+                return;
+            };
+            let session = session.borrow();
+            let outcome = match &session.load.presentation {
+                ConflictPresentation::TextBlocks(file) => {
+                    match file.build_resolved(&session.resolutions) {
+                        Ok(bytes) => Outcome::Write(bytes),
+                        Err(_) => return, // §38: apply is enabled only when complete
+                    }
+                }
+                ConflictPresentation::KeepOrDelete { .. } => match session.file_choice {
+                    conflict_view::FileChoice::KeepFile => Outcome::Stage,
+                    conflict_view::FileChoice::DeleteFile => Outcome::Delete,
+                    _ => return,
+                },
+                ConflictPresentation::ResolveAsDeleted => Outcome::Delete,
+                ConflictPresentation::WholeFileChoice {
+                    version_a,
+                    version_b,
+                } => match session.file_choice {
+                    conflict_view::FileChoice::UseVersionA => {
+                        Outcome::Write(version_a.bytes.clone())
+                    }
+                    conflict_view::FileChoice::UseVersionB => {
+                        Outcome::Write(version_b.bytes.clone())
+                    }
+                    _ => return,
+                },
+                ConflictPresentation::AlreadyManuallyResolved => Outcome::Stage,
+                ConflictPresentation::Unsupported(_) => return,
+            };
+            (path, session.load.working_tree.clone(), outcome)
+        };
+        let (path, snapshot, outcome) = prepared;
+
+        // §39-40: external modifications are never overwritten.
+        match self
+            .repo
+            .conflict_file_unchanged(&path, snapshot.as_deref())
+        {
+            Ok(true) => {}
+            Ok(false) => {
+                self.state.borrow_mut().conflict_sessions.remove(&path);
+                let toast = adw::Toast::new(
+                    "The file changed since the conflict solver was opened.\nRefresh the conflict before applying the resolution.",
+                );
+                toast.set_timeout(8);
+                self.toast_overlay.add_toast(toast);
+                self.refresh();
+                return;
+            }
+            Err(error) => {
+                self.show_error(&error);
+                return;
+            }
+        }
+
+        let result = match outcome {
+            Outcome::Write(bytes) => self.repo.apply_conflict_resolution(&path, &bytes),
+            Outcome::Stage => self.repo.mark_resolved(&path),
+            Outcome::Delete => self.repo.mark_deleted(&path),
+        };
+        match result {
+            Ok(()) => {
+                self.state.borrow_mut().conflict_sessions.remove(&path);
+                self.refresh();
+            }
+            Err(Error::Git(git_error)) => {
+                // §44: the file may hold the resolution without being staged.
+                log::warn!("{}", git_error.details());
+                let toast = adw::Toast::new(
+                    "The file on disk contains the resolution but is not staged yet.\nCheck the message in the logs, then apply again.",
+                );
+                toast.set_timeout(8);
+                self.toast_overlay.add_toast(toast);
+                self.refresh();
+            }
+            Err(error) => self.show_error(&error),
+        }
+    }
+
+    /// Stages the current content as the resolution (§41).
+    fn mark_conflict_resolved(&self) {
+        let path = {
+            let state = self.state.borrow();
+            match &state.selection {
+                Some(Selection::Conflicted(path)) => path.clone(),
+                _ => return,
+            }
+        };
+        match self.repo.mark_resolved(&path) {
+            Ok(()) => {
+                self.state.borrow_mut().conflict_sessions.remove(&path);
+                self.refresh();
+            }
+            Err(error) => self.show_error(&error),
+        }
+    }
+
+    /// Reloads the selected conflict (§42, §61).
+    fn refresh_conflict(&self) {
+        let pending = {
+            let mut state = self.state.borrow_mut();
+            match state.selection.clone() {
+                Some(Selection::Conflicted(path)) => {
+                    state.conflict_sessions.remove(&path);
+                    state.conflict_errors.remove(&path);
+                    Some((state.commit_diff_generation, path))
+                }
+                _ => None,
+            }
+        };
+        if let Some((generation, path)) = pending {
+            self.load_conflict(generation, path);
+        }
     }
 
     /// Runs the global search on the worker thread
@@ -1198,14 +1521,20 @@ impl Inner {
                 }
                 None => diff_view::RenderedDiff::plain(diff_view::placeholder("Loading…")),
             },
-            Some(Selection::Conflicted(path)) => match state.data.as_ref() {
-                Some(data) => self.render_file_diff(
-                    &data.worktree,
-                    path,
-                    DiffSide::Conflicted,
-                    focus.as_ref(),
+            Some(Selection::Conflicted(path)) => match state.conflict_sessions.get(path) {
+                Some(session) => conflict_view::render(
+                    &session.borrow(),
+                    &self.highlighter,
+                    &self.conflict_callbacks(),
                 ),
-                None => diff_view::RenderedDiff::plain(diff_view::placeholder("Loading…")),
+                None => match state.conflict_errors.get(path) {
+                    Some(message) => {
+                        diff_view::RenderedDiff::plain(diff_view::placeholder(message))
+                    }
+                    None => {
+                        diff_view::RenderedDiff::plain(diff_view::placeholder("Loading conflict…"))
+                    }
+                },
             },
             Some(Selection::Commit(oid)) => match &state.commit_diff {
                 Some((cached, diff)) if cached == oid => {

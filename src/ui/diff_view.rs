@@ -715,7 +715,13 @@ fn hunk_body(
 }
 
 /// Applies `tags` to a character range of one buffer line.
-fn apply_range(buffer: &TextBuffer, line: i32, start: usize, end: usize, tags: &[TextTag]) {
+pub(crate) fn apply_range(
+    buffer: &TextBuffer,
+    line: i32,
+    start: usize,
+    end: usize,
+    tags: &[TextTag],
+) {
     if start >= end {
         return;
     }
@@ -758,7 +764,7 @@ fn file_button(label: &str, on_click: impl Fn() + 'static) -> Button {
     button
 }
 
-fn set_margins(widget: &impl IsA<gtk4::Widget>, margin: i32) {
+pub(crate) fn set_margins(widget: &impl IsA<gtk4::Widget>, margin: i32) {
     widget.set_margin_top(margin);
     widget.set_margin_bottom(margin);
     widget.set_margin_start(margin);

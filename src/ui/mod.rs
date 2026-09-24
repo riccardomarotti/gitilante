@@ -2,6 +2,7 @@
 
 pub mod app;
 pub mod changes;
+pub mod conflict_view;
 pub mod diff_view;
 pub mod folding;
 pub mod graph_gutter;
