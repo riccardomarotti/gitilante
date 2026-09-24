@@ -670,6 +670,10 @@ impl Inner {
                     let untracked = repo.untracked_files().unwrap_or_default();
                     results.extend(crate::search::contents::search(&query, &repo, &untracked));
                 }
+                if matches!(query.scope, SearchScope::All | SearchScope::History) {
+                    let refs = repo.commit_refs().unwrap_or_default();
+                    results.extend(crate::search::history::search(&query, &repo, &refs));
+                }
                 results
             },
             move |results| {
@@ -693,9 +697,18 @@ impl Inner {
                 Some(content.line_number),
                 &content.match_ranges,
             ),
+            SearchResult::Commit(commit) => self.navigate_to_commit(&commit.oid),
             // The other providers arrive with their phases.
             _ => {}
         }
+    }
+
+    /// Selects a commit in the History and loads its diff through the normal
+    /// mechanism (GITILANTE_SEARCH_SPEC.md section 26): the commit works even
+    /// when it is outside the loaded History blocks.
+    fn navigate_to_commit(&self, oid: &str) {
+        self.search_dialog.close();
+        self.select(Selection::Commit(oid.to_owned()));
     }
 
     /// Opens the read-only preview of a file (GITILANTE_SEARCH_SPEC.md §16).

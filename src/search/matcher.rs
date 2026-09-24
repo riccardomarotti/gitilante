@@ -21,6 +21,29 @@ pub fn chars_match(needle: char, haystack: char, case_sensitive: bool) -> bool {
     }
 }
 
+fn fold(text: &str, case_sensitive: bool) -> String {
+    if case_sensitive {
+        text.to_owned()
+    } else {
+        text.to_lowercase()
+    }
+}
+
+/// Whole-text equality under the requested case mode.
+pub fn text_equals(haystack: &str, needle: &str, case_sensitive: bool) -> bool {
+    fold(haystack, case_sensitive) == fold(needle, case_sensitive)
+}
+
+/// Prefix match under the requested case mode.
+pub fn text_starts_with(haystack: &str, needle: &str, case_sensitive: bool) -> bool {
+    fold(haystack, case_sensitive).starts_with(&fold(needle, case_sensitive))
+}
+
+/// Substring match under the requested case mode.
+pub fn text_contains(haystack: &str, needle: &str, case_sensitive: bool) -> bool {
+    fold(haystack, case_sensitive).contains(&fold(needle, case_sensitive))
+}
+
 /// Finds the non-overlapping matches of `query` as character ranges.
 pub fn find_matches(text: &str, query: &str, case_sensitive: bool) -> Vec<(usize, usize)> {
     let haystack: Vec<char> = text.chars().collect();

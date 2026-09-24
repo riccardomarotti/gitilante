@@ -269,7 +269,7 @@ fn push_badges(
 }
 
 /// Formats a Unix timestamp as a relative date ("3 days ago").
-fn relative_time(timestamp: i64) -> String {
+pub fn relative_time(timestamp: i64) -> String {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs() as i64)

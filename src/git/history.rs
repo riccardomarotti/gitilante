@@ -82,6 +82,79 @@ pub fn commit_diff(repo: &Repository, oid: &str) -> Result<Diff> {
     })
 }
 
+/// Runs `git log` with `filters` over the same revisions as [`history`]
+/// (GITILANTE_SEARCH_SPEC.md sections 23-24).
+pub fn log_filtered(
+    repo: &Repository,
+    filters: &[String],
+    max_count: usize,
+) -> Result<Vec<Commit>> {
+    let include_head = head_exists(repo)?;
+    let mut args: Vec<String> = vec![
+        "-c".to_owned(),
+        "core.quotePath=true".to_owned(),
+        "log".to_owned(),
+        "--topo-order".to_owned(),
+        "--no-decorate".to_owned(),
+        "--no-show-signature".to_owned(),
+        format!("--format={LOG_FORMAT}"),
+        format!("--max-count={max_count}"),
+    ];
+    args.extend(filters.iter().cloned());
+    if include_head {
+        args.push("HEAD".to_owned());
+    }
+    args.push("--branches".to_owned());
+    args.push("--remotes".to_owned());
+
+    let output = command::run(repo.root(), &args)?;
+    parse(&output.stdout).map_err(|detail| Error::MalformedOutput {
+        command: "log".to_owned(),
+        detail,
+    })
+}
+
+/// Loads the commits with the given object names, in date order
+/// (GITILANTE_SEARCH_SPEC.md section 26).
+pub fn commits_by_oid(repo: &Repository, oids: &[String]) -> Result<Vec<Commit>> {
+    if oids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut args: Vec<String> = vec![
+        "-c".to_owned(),
+        "core.quotePath=true".to_owned(),
+        "log".to_owned(),
+        "--no-decorate".to_owned(),
+        "--no-show-signature".to_owned(),
+        format!("--format={LOG_FORMAT}"),
+        format!("--max-count={}", oids.len()),
+        "--no-walk=sorted".to_owned(),
+        "--".to_owned(),
+    ];
+    args.extend(oids.iter().cloned());
+
+    let output = command::run(repo.root(), &args)?;
+    parse(&output.stdout).map_err(|detail| Error::MalformedOutput {
+        command: "log".to_owned(),
+        detail,
+    })
+}
+
+/// Resolves a revision (an object name prefix or a ref name) to a commit.
+pub fn resolve_commit(repo: &Repository, revision: &str) -> Result<Option<String>> {
+    let revision = format!("{revision}^{{commit}}");
+    match command::run(
+        repo.root(),
+        &["rev-parse", "--verify", "--quiet", &revision],
+    ) {
+        Ok(output) => Ok(Some(
+            String::from_utf8_lossy(&output.stdout).trim().to_owned(),
+        )),
+        Err(Error::Git(_)) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
 /// Parses `git log` output produced with [`LOG_FORMAT`].
 pub fn parse(input: &[u8]) -> ParseResult<Vec<Commit>> {
     let mut commits = Vec::new();

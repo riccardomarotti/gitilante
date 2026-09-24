@@ -90,3 +90,52 @@ fn short_queries_find_nothing() {
     let backend = repo.repository();
     assert!(contents::search(&query("n"), &backend, &[]).is_empty());
 }
+
+#[test]
+fn finds_commits_by_subject_author_and_object_name() {
+    // GITILANTE_SEARCH_SPEC.md sections 23 and 66.
+    let repo = TestRepo::new();
+    repo.write("a.txt", b"one\n");
+    repo.git(&["add", "-A"]);
+    repo.git(&[
+        "commit",
+        "-m",
+        "Fix timeout handling",
+        "--author=Ada Lovelace <ada@example.com>",
+    ]);
+    let oid = repo.git(&["rev-parse", "HEAD"]).trim().to_owned();
+
+    let backend = repo.repository();
+    let refs = backend.commit_refs().expect("refs");
+
+    let results = gitilante::search::history::search(&query("timeout"), &backend, &refs);
+    assert_eq!(results.len(), 1, "subject match: {results:#?}");
+
+    let results = gitilante::search::history::search(&query("Ada"), &backend, &refs);
+    assert_eq!(results.len(), 1, "author match: {results:#?}");
+
+    // An object name prefix resolves to its commit (section 25).
+    let results = gitilante::search::history::search(&query(&oid[..8]), &backend, &refs);
+    let SearchResult::Commit(commit) = &results[0] else {
+        panic!("expected a commit result");
+    };
+    assert_eq!(commit.oid, oid);
+}
+
+#[test]
+fn finds_commits_by_ref_name() {
+    // GITILANTE_SEARCH_SPEC.md section 23.
+    let repo = TestRepo::new();
+    repo.write("a.txt", b"one\n");
+    repo.commit_all("base");
+    repo.git(&["branch", "feature/parser"]);
+
+    let backend = repo.repository();
+    let refs = backend.commit_refs().expect("refs");
+    let results = gitilante::search::history::search(&query("feature"), &backend, &refs);
+    assert_eq!(results.len(), 1, "ref match: {results:#?}");
+    let SearchResult::Commit(commit) = &results[0] else {
+        panic!("expected a commit result");
+    };
+    assert!(commit.refs.iter().any(|name| name == "feature/parser"));
+}

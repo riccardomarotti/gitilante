@@ -9,7 +9,7 @@
 use std::path::Path;
 
 use crate::search::SEARCH_RESULTS_PER_PROVIDER;
-use crate::search::matcher::chars_match;
+use crate::search::matcher::{chars_match, text_contains, text_equals, text_starts_with};
 use crate::search::query::SearchQuery;
 use crate::search::result::{FileSearchResult, SearchResult};
 
@@ -64,42 +64,22 @@ fn path_tier(path: &Path, tokens: &[&str], case_sensitive: bool) -> Option<usize
 }
 
 fn token_tier(name: &str, full: &str, token: &str, case_sensitive: bool) -> Option<usize> {
-    if equals(name, token, case_sensitive) {
+    if text_equals(name, token, case_sensitive) {
         return Some(0);
     }
-    if starts_with(name, token, case_sensitive) {
+    if text_starts_with(name, token, case_sensitive) {
         return Some(1);
     }
-    if substring(name, token, case_sensitive) {
+    if text_contains(name, token, case_sensitive) {
         return Some(2);
     }
     if fuzzy(name, token, case_sensitive) {
         return Some(3);
     }
-    if substring(full, token, case_sensitive) {
+    if text_contains(full, token, case_sensitive) {
         return Some(4);
     }
     None
-}
-
-fn fold(text: &str, case_sensitive: bool) -> String {
-    if case_sensitive {
-        text.to_owned()
-    } else {
-        text.to_lowercase()
-    }
-}
-
-fn equals(haystack: &str, needle: &str, case_sensitive: bool) -> bool {
-    fold(haystack, case_sensitive) == fold(needle, case_sensitive)
-}
-
-fn starts_with(haystack: &str, needle: &str, case_sensitive: bool) -> bool {
-    fold(haystack, case_sensitive).starts_with(&fold(needle, case_sensitive))
-}
-
-fn substring(haystack: &str, needle: &str, case_sensitive: bool) -> bool {
-    fold(haystack, case_sensitive).contains(&fold(needle, case_sensitive))
 }
 
 /// Subsequence match: every needle character appears in order (section 14).

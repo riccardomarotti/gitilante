@@ -81,14 +81,17 @@ impl SearchDialog {
         let scope_changes = ToggleButton::with_label("Changes");
         let scope_files = ToggleButton::with_label("Files");
         let scope_contents = ToggleButton::with_label("Contents");
+        let scope_history = ToggleButton::with_label("History");
         scope_changes.set_group(Some(&scope_all));
         scope_files.set_group(Some(&scope_all));
         scope_contents.set_group(Some(&scope_all));
+        scope_history.set_group(Some(&scope_all));
         scope_all.set_active(true);
         scopes.append(&scope_all);
         scopes.append(&scope_changes);
         scopes.append(&scope_files);
         scopes.append(&scope_contents);
+        scopes.append(&scope_history);
         content.append(&scopes);
 
         // Added/Removed filter, shown only for the Changes scope (section 10).
@@ -192,6 +195,16 @@ impl SearchDialog {
             scope_contents.connect_toggled(move |button| {
                 if button.is_active() {
                     shared.query.borrow_mut().scope = SearchScope::Contents;
+                    update_filter_visibility(&shared);
+                    run_search(&shared);
+                }
+            });
+        }
+        {
+            let shared = shared.clone();
+            scope_history.connect_toggled(move |button| {
+                if button.is_active() {
+                    shared.query.borrow_mut().scope = SearchScope::History;
                     update_filter_visibility(&shared);
                     run_search(&shared);
                 }
