@@ -31,12 +31,28 @@ const BADGE_CSS: &str = r#"
 }
 "#;
 
+/// The single-key hunk shortcuts (SPEC section 30) are suspended while a search
+/// bar has the keyboard focus, so typing is never intercepted
+/// (GITILANTE_SEARCH_SPEC.md section 51).
+pub fn suspend_hunk_shortcuts(app: &adw::Application, suspended: bool) {
+    let (stage, unstage, discard, revert): (&[&str], &[&str], &[&str], &[&str]) = if suspended {
+        (&[], &[], &[], &[])
+    } else {
+        (&["s"], &["u"], &["d"], &["r"])
+    };
+    app.set_accels_for_action("win.stage-hunk", stage);
+    app.set_accels_for_action("win.unstage-hunk", unstage);
+    app.set_accels_for_action("win.discard-hunk", discard);
+    app.set_accels_for_action("win.revert-hunk", revert);
+}
+
 /// Runs the Gitilante GUI on `repo`, returning the process exit code.
 pub fn run(repo: Repository) -> i32 {
     let app = adw::Application::builder().application_id(APP_ID).build();
 
     app.set_accels_for_action("win.refresh", &["<Primary>r"]);
     app.set_accels_for_action("win.search", &["<Primary>f"]);
+    app.set_accels_for_action("win.global-search", &["<Primary><Shift>f"]);
 
     // Ref badge styling for the History graph (BRANCH.md section 41).
     app.connect_startup(|_| {

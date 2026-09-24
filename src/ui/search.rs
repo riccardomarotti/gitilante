@@ -17,6 +17,7 @@ use gtk4::pango;
 use gtk4::prelude::*;
 use gtk4::{Box as GtkBox, Button, Label, Orientation, ScrolledWindow, SearchEntry, TextTag};
 
+use crate::search::matcher::{find_matches, is_case_sensitive};
 use crate::ui::diff_view::SearchTarget;
 
 /// Background of a non-active search match.
@@ -53,6 +54,8 @@ struct Shared {
     matches: RefCell<Vec<MatchLoc>>,
     active: Cell<usize>,
     query: RefCell<String>,
+    /// Told when the bar gains/loses the keyboard focus.
+    on_focus: Box<dyn Fn(bool)>,
 }
 
 /// The search bar shown above the diff panel.
@@ -63,7 +66,11 @@ pub struct SearchBar {
 
 impl SearchBar {
     /// Creates the search bar for the content of `scrolled` (initially hidden).
-    pub fn new(scrolled: ScrolledWindow) -> Self {
+    ///
+    /// `on_focus` is called with `true` when the bar takes the keyboard focus
+    /// and with `false` when it closes: single-key shortcuts must not intercept
+    /// typing (GITILANTE_SEARCH_SPEC.md section 51).
+    pub fn new(scrolled: ScrolledWindow, on_focus: Box<dyn Fn(bool)>) -> Self {
         let root = GtkBox::new(Orientation::Horizontal, 6);
         root.set_margin_top(6);
         root.set_margin_bottom(6);
@@ -99,6 +106,7 @@ impl SearchBar {
             matches: RefCell::new(Vec::new()),
             active: Cell::new(0),
             query: RefCell::new(String::new()),
+            on_focus,
         });
 
         {
@@ -152,6 +160,7 @@ impl SearchBar {
     /// Shows the bar, focusing the query field (GITILANTE_SEARCH_SPEC.md §2).
     pub fn open(&self) {
         self.root.set_visible(true);
+        (self.shared.on_focus)(true);
         self.shared.entry.grab_focus();
         self.shared.entry.select_region(0, -1);
         refresh(&self.shared);
@@ -321,37 +330,58 @@ fn close(shared: &Rc<Shared>) {
     if let Some(bar) = shared.entry.parent() {
         bar.set_visible(false);
     }
+    (shared.on_focus)(false);
 }
 
-/// Scrolls the active match into view, both in its text view and in the outer
-/// scroll of the diff panel (GITILANTE_SEARCH_SPEC.md section 3).
+/// Scrolls the active match into view.
 fn reveal(shared: &Rc<Shared>) {
     let matches = shared.matches.borrow();
     let Some(match_loc) = matches.get(shared.active.get()) else {
         return;
     };
     let targets = shared.targets.borrow();
-    let state = &targets[match_loc.target];
-    let mut iter = state.target.buffer.iter_at_offset(match_loc.start);
-    state
-        .target
-        .view
-        .scroll_to_iter(&mut iter, 0.0, false, 0.0, 0.3);
+    reveal_in(
+        &shared.scrolled,
+        &targets[match_loc.target].target,
+        match_loc.start,
+    );
+}
 
-    let Some(content) = shared.scrolled.child() else {
+/// Scrolls `char_offset` of `target` into view, both in its text view and in
+/// the outer scroll of the diff panel (GITILANTE_SEARCH_SPEC.md sections 3
+/// and 12).
+pub fn reveal_in(scrolled: &ScrolledWindow, target: &SearchTarget, char_offset: i32) {
+    let iter = target.buffer.iter_at_offset(char_offset);
+    reveal_iter(scrolled, target, &iter);
+}
+
+/// Scrolls `iter` of `target` into view (GITILANTE_SEARCH_SPEC.md section 12).
+pub fn reveal_iter(scrolled: &ScrolledWindow, target: &SearchTarget, iter: &gtk4::TextIter) {
+    let mut iter = *iter;
+    target.view.scroll_to_iter(&mut iter, 0.0, false, 0.0, 0.3);
+
+    let Some(content) = scrolled.child() else {
         return;
     };
-    let location = state.target.view.iter_location(&iter);
-    if let Some((_, y)) = state.target.view.translate_coordinates(
+    let location = target.view.iter_location(&iter);
+    if let Some((_, y)) = target.view.translate_coordinates(
         &content,
         f64::from(location.x()),
         f64::from(location.y()),
     ) {
-        let adjustment = shared.scrolled.vadjustment();
+        let adjustment = scrolled.vadjustment();
         let top = y - adjustment.page_size() / 3.0;
         let maximum = (adjustment.upper() - adjustment.page_size()).max(adjustment.lower());
         adjustment.set_value(top.clamp(adjustment.lower(), maximum));
     }
+}
+
+/// Creates the temporary highlight tag for a landed search result
+/// (GITILANTE_SEARCH_SPEC.md section 12).
+pub fn flash_tag(buffer: &gtk4::TextBuffer) -> TextTag {
+    buffer
+        .create_tag(None::<&str>, &[("background-rgba", &active_background())])
+        .expect("create text tag")
 }
 
 /// The full text of a target's buffer.
@@ -359,101 +389,4 @@ fn buffer_text(target: &SearchTarget) -> String {
     let start = target.buffer.start_iter();
     let end = target.buffer.end_iter();
     target.buffer.text(&start, &end, false).to_string()
-}
-
-/// Smart case: sensitive only when the query contains an uppercase character
-/// (GITILANTE_SEARCH_SPEC.md section 8).
-fn is_case_sensitive(query: &str) -> bool {
-    query.chars().any(char::is_uppercase)
-}
-
-fn chars_match(needle: char, haystack: char, case_sensitive: bool) -> bool {
-    if case_sensitive {
-        needle == haystack
-    } else {
-        needle.to_lowercase().eq(haystack.to_lowercase())
-    }
-}
-
-/// Finds the non-overlapping matches of `query` as character ranges.
-///
-/// Offsets are character based, never byte based: GTK text iterators use
-/// character offsets (GITILANTE_SEARCH_SPEC.md section 40).
-fn find_matches(text: &str, query: &str, case_sensitive: bool) -> Vec<(usize, usize)> {
-    let haystack: Vec<char> = text.chars().collect();
-    let needle: Vec<char> = query.chars().collect();
-    if needle.is_empty() || needle.len() > haystack.len() {
-        return Vec::new();
-    }
-    let mut matches = Vec::new();
-    let mut index = 0;
-    while index + needle.len() <= haystack.len() {
-        if needle.iter().enumerate().all(|(offset, &needle_char)| {
-            chars_match(needle_char, haystack[index + offset], case_sensitive)
-        }) {
-            matches.push((index, index + needle.len()));
-            index += needle.len();
-        } else {
-            index += 1;
-        }
-    }
-    matches
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn finds_plain_matches() {
-        assert_eq!(
-            find_matches("ab abc ab", "ab", true),
-            vec![(0, 2), (3, 5), (7, 9)]
-        );
-        assert!(find_matches("abc", "abcd", true).is_empty());
-        assert!(find_matches("abc", "", true).is_empty());
-    }
-
-    #[test]
-    fn matches_do_not_overlap() {
-        assert_eq!(find_matches("aaaa", "aa", true), vec![(0, 2), (2, 4)]);
-    }
-
-    #[test]
-    fn smart_case_follows_the_query() {
-        assert!(!is_case_sensitive("timeout"));
-        assert!(is_case_sensitive("Timeout"));
-        assert_eq!(
-            find_matches("Timeout timeout TIMEOUT", "timeout", false),
-            vec![(0, 7), (8, 15), (16, 23)]
-        );
-        assert_eq!(
-            find_matches("Timeout timeout", "Timeout", true),
-            vec![(0, 7)]
-        );
-    }
-
-    #[test]
-    fn offsets_are_character_based() {
-        // GITILANTE_SEARCH_SPEC.md section 40: città, café, 日本語, 😀.
-        assert_eq!(
-            find_matches("città città", "città", true),
-            vec![(0, 5), (6, 11)]
-        );
-        assert_eq!(
-            find_matches("café café", "café", true),
-            vec![(0, 4), (5, 9)]
-        );
-        assert_eq!(
-            find_matches("日本語のテキスト", "日本語", true),
-            vec![(0, 3)]
-        );
-        assert_eq!(find_matches("😀😀", "😀", true), vec![(0, 1), (1, 2)]);
-    }
-
-    #[test]
-    fn insensitive_matching_spans_lines() {
-        let text = "first line\nsecond line\nfirst again";
-        assert_eq!(find_matches(text, "first", false), vec![(0, 5), (23, 28)]);
-    }
 }

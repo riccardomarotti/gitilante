@@ -24,8 +24,12 @@ use crate::model::commit::Commit;
 use crate::model::diff::{Diff, FileDiff, Hunk};
 use crate::model::refs::{CommitRef, HeadRef};
 use crate::model::status::{Status, StatusEntry};
+use crate::search::SearchQuery;
+use crate::search::result::{ChangeSearchResult, SearchResult};
 use crate::ui::worker::Worker;
-use crate::ui::{DiffSide, HunkTarget, Selection, changes, diff_view, history, search, short_path};
+use crate::ui::{
+    DiffSide, HunkTarget, Selection, changes, diff_view, history, search, search_dialog, short_path,
+};
 
 /// Commits per history block (SPEC section 16).
 const HISTORY_PAGE: usize = 200;
@@ -71,6 +75,8 @@ struct State {
     commit_diff_generation: u64,
     /// Hunk that has keyboard focus, target of the contextual shortcuts.
     current_hunk: Option<HunkTarget>,
+    /// Searchable text of the currently rendered diff (section 3).
+    render_targets: Vec<crate::ui::diff_view::SearchTarget>,
 }
 
 struct Inner {
@@ -90,6 +96,10 @@ struct Inner {
     history_view: history::HistoryView,
     /// Ctrl+F search bar over the diff panel (GITILANTE_SEARCH_SPEC.md §3).
     search_bar: search::SearchBar,
+    /// Ctrl+Shift+F global search dialog (GITILANTE_SEARCH_SPEC.md §5).
+    search_dialog: Rc<search_dialog::SearchDialog>,
+    /// Bumped on every search: stale results are dropped (section 35).
+    search_generation: Cell<u64>,
     diff_box: GtkBox,
     diff_scroll: ScrolledWindow,
     /// Sidebar scroll, anchored across History rebuilds.
@@ -195,7 +205,43 @@ impl Inner {
 
         // The search bar sits above the diff panel
         // (GITILANTE_SEARCH_SPEC.md section 3).
-        let search_bar = search::SearchBar::new(diff_scroll.clone());
+        let search_bar = {
+            let app = app.clone();
+            search::SearchBar::new(
+                diff_scroll.clone(),
+                Box::new(move |focused| {
+                    // Typing must never trigger the hunk shortcuts (section 51).
+                    crate::ui::app::suspend_hunk_shortcuts(&app, focused);
+                }),
+            )
+        };
+
+        // Global search dialog (GITILANTE_SEARCH_SPEC.md section 5).
+        let search_dialog = {
+            let weak = self_weak.clone();
+            Rc::new(search_dialog::SearchDialog::new(search_dialog::Callbacks {
+                search: Box::new(move |query| {
+                    if let Some(inner) = weak.upgrade() {
+                        inner.run_search(query);
+                    }
+                }),
+                activate: {
+                    let weak = self_weak.clone();
+                    Box::new(move |result| {
+                        if let Some(inner) = weak.upgrade() {
+                            inner.activate_search_result(result);
+                        }
+                    })
+                },
+                on_open: {
+                    let app = app.clone();
+                    Box::new(move |open| {
+                        // Typing must never trigger the hunk shortcuts (§51).
+                        crate::ui::app::suspend_hunk_shortcuts(&app, open);
+                    })
+                },
+            }))
+        };
         let diff_panel = GtkBox::new(Orientation::Vertical, 0);
         diff_panel.append(search_bar.widget());
         diff_panel.append(&diff_scroll);
@@ -247,6 +293,20 @@ impl Inner {
             });
         }
         window.add_action(&search_action);
+
+        // Ctrl+Shift+F: global search (GITILANTE_SEARCH_SPEC.md section 2).
+        let global_search_action = gio::SimpleAction::new("global-search", None);
+        {
+            let weak = self_weak.clone();
+            global_search_action.connect_activate(move |_, _| {
+                if let Some(inner) = weak.upgrade() {
+                    if !inner.search_dialog.is_open() {
+                        inner.search_dialog.present(&inner.window);
+                    }
+                }
+            });
+        }
+        window.add_action(&global_search_action);
 
         // Contextual hunk shortcuts, acting on the focused hunk (SPEC §30).
         for (name, activate) in [
@@ -304,6 +364,8 @@ impl Inner {
             changes,
             history_view,
             search_bar,
+            search_dialog,
+            search_generation: Cell::new(0),
             diff_box,
             diff_scroll,
             sidebar_adjustment: sidebar_scroll.vadjustment(),
@@ -526,6 +588,94 @@ impl Inner {
         }
     }
 
+    /// Runs the global search on the worker thread
+    /// (GITILANTE_SEARCH_SPEC.md sections 52-53).
+    fn run_search(&self, query: SearchQuery) {
+        let generation = self.search_generation.get() + 1;
+        self.search_generation.set(generation);
+        let (worktree, staged) = {
+            let state = self.state.borrow();
+            match state.data.as_ref() {
+                Some(data) => (data.worktree.clone(), data.staged.clone()),
+                None => (Diff::default(), Diff::default()),
+            }
+        };
+        let weak = self.self_weak.clone();
+        self.worker.run(
+            move || {
+                // Phase 2-3: the Changes provider works on the diffs already
+                // loaded, it never re-runs git diff (section 53).
+                crate::search::changes::search(&query, &worktree, &staged)
+            },
+            move |results| {
+                if let Some(inner) = weak.upgrade() {
+                    // A stale search never overwrites newer ones (section 35).
+                    if inner.search_generation.get() == generation {
+                        inner.search_dialog.show_results(results);
+                    }
+                }
+            },
+        );
+    }
+
+    /// Navigates to an activated search result (GITILANTE_SEARCH_SPEC.md §12).
+    fn activate_search_result(&self, result: SearchResult) {
+        // The other providers arrive with their phases.
+        if let SearchResult::Change(change) = result {
+            self.navigate_to_change(&change);
+        }
+    }
+
+    fn navigate_to_change(&self, result: &ChangeSearchResult) {
+        self.search_dialog.close();
+        let selection = match result.side {
+            DiffSide::Staged => Selection::Staged(result.path.clone()),
+            _ => Selection::Unstaged(result.path.clone()),
+        };
+        self.select(selection);
+        // Mark the file in the Changes sidebar too.
+        self.render_changes();
+
+        // Scroll to the matched line and flash it briefly (section 12).
+        let target = {
+            let state = self.state.borrow();
+            state.render_targets.get(result.hunk_index).cloned()
+        };
+        let Some(target) = target else {
+            return;
+        };
+        let flash = search::flash_tag(&target.buffer);
+        for range in &result.match_ranges {
+            let (Some(start), Some(end)) = (
+                target
+                    .buffer
+                    .iter_at_line_offset(result.line_index as i32, range.start as i32),
+                target
+                    .buffer
+                    .iter_at_line_offset(result.line_index as i32, range.end as i32),
+            ) else {
+                continue;
+            };
+            target.buffer.apply_tag(&flash, &start, &end);
+        }
+        let offset = result
+            .match_ranges
+            .first()
+            .map(|range| range.start as i32)
+            .unwrap_or(0);
+        if let Some(iter) = target
+            .buffer
+            .iter_at_line_offset(result.line_index as i32, offset)
+        {
+            search::reveal_iter(&self.diff_scroll, &target, &iter);
+        }
+        gtk4::glib::timeout_add_local_once(std::time::Duration::from_millis(1400), move || {
+            let start = target.buffer.start_iter();
+            let end = target.buffer.end_iter();
+            target.buffer.remove_tag(&flash, &start, &end);
+        });
+    }
+
     /// Rebuilds the Changes sidebar.
     fn render_changes(&self) {
         let (data, selection) = {
@@ -608,7 +758,9 @@ impl Inner {
             },
         };
         self.diff_box.append(&rendered.widget);
-        // Ctrl+F searches the freshly rendered text (GITILANTE_SEARCH_SPEC.md §3).
+        // Ctrl+F searches the freshly rendered text (GITILANTE_SEARCH_SPEC.md §3);
+        // the same targets drive the result navigation (section 12).
+        state.render_targets = rendered.targets.clone();
         self.search_bar.set_targets(rendered.targets);
         self.diff_scroll.vadjustment().set_value(0.0);
     }

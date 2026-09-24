@@ -7,5 +7,6 @@ pub mod git;
 pub mod graph;
 pub mod intraline;
 pub mod model;
+pub mod search;
 pub mod syntax;
 pub mod ui;
