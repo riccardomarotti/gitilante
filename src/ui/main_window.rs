@@ -100,6 +100,10 @@ struct Inner {
     highlighter: crate::syntax::Highlighter,
     /// Folding state of the rendered diffs (GITILANTE_DIFF_FOLDING_SPEC.md §15).
     folds: RefCell<folding::FoldStateStore>,
+    /// Disclosure to focus after a folding toggle (section 26).
+    pending_focus: Cell<Option<folding::FoldFocus>>,
+    /// Query whose hidden matches were revealed last (sections 30-32).
+    last_reveal_query: RefCell<Option<String>>,
     self_weak: Weak<Inner>,
     window: adw::ApplicationWindow,
     toast_overlay: adw::ToastOverlay,
@@ -149,6 +153,18 @@ impl Inner {
         refresh_button.set_tooltip_text(Some("Refresh (Ctrl+R)"));
         refresh_button.set_action_name(Some("win.refresh"));
         header.pack_end(&refresh_button);
+
+        // Diff folding menu (GITILANTE_DIFF_FOLDING_SPEC.md section 21).
+        let fold_menu = gio::Menu::new();
+        fold_menu.append(Some("Collapse all files"), Some("win.fold-collapse-files"));
+        fold_menu.append(Some("Expand all files"), Some("win.fold-expand-files"));
+        fold_menu.append(Some("Collapse all hunks"), Some("win.fold-collapse-hunks"));
+        fold_menu.append(Some("Expand all hunks"), Some("win.fold-expand-hunks"));
+        let fold_button = gtk4::MenuButton::new();
+        fold_button.set_icon_name("open-menu-symbolic");
+        fold_button.set_menu_model(Some(&fold_menu));
+        fold_button.set_tooltip_text(Some("Diff folding"));
+        header.pack_end(&fold_button);
 
         // Loading state: spins while any Git request is in flight (SPEC §35).
         let spinner = gtk4::Spinner::new();
@@ -220,11 +236,17 @@ impl Inner {
         // (GITILANTE_SEARCH_SPEC.md section 3).
         let search_bar = {
             let app = app.clone();
+            let weak = self_weak.clone();
             search::SearchBar::new(
                 diff_scroll.clone(),
                 Box::new(move |focused| {
                     // Typing must never trigger the hunk shortcuts (section 51).
                     crate::ui::app::suspend_hunk_shortcuts(&app, focused);
+                }),
+                Box::new(move |query| {
+                    if let Some(inner) = weak.upgrade() {
+                        inner.reveal_hidden_matches(query);
+                    }
                 }),
             )
         };
@@ -319,6 +341,23 @@ impl Inner {
         }
         window.add_action(&global_search_action);
 
+        // Diff folding actions (GITILANTE_DIFF_FOLDING_SPEC.md sections 21-22).
+        for (name, action) in [
+            ("fold-collapse-files", folding::FoldAction::CollapseAllFiles),
+            ("fold-expand-files", folding::FoldAction::ExpandAllFiles),
+            ("fold-collapse-hunks", folding::FoldAction::CollapseAllHunks),
+            ("fold-expand-hunks", folding::FoldAction::ExpandAllHunks),
+        ] {
+            let fold_action = gio::SimpleAction::new(name, None);
+            let weak = self_weak.clone();
+            fold_action.connect_activate(move |_, _| {
+                if let Some(inner) = weak.upgrade() {
+                    inner.fold_all(action);
+                }
+            });
+            window.add_action(&fold_action);
+        }
+
         // Contextual hunk shortcuts, acting on the focused hunk (SPEC §30).
         for (name, activate) in [
             ("stage-hunk", Inner::shortcut_stage_hunk as fn(&Inner)),
@@ -368,6 +407,8 @@ impl Inner {
             busy: Cell::new(0),
             highlighter: crate::syntax::Highlighter::new(),
             folds: RefCell::new(folding::FoldStateStore::default()),
+            pending_focus: Cell::new(None),
+            last_reveal_query: RefCell::new(None),
             self_weak,
             window,
             toast_overlay,
@@ -763,8 +804,8 @@ impl Inner {
             (query, diff, state.render_targets.clone())
         };
         let case_sensitive = query.is_case_sensitive();
-        let mut hunk_index = 0;
-        for file in &diff.files {
+        let mut found = None;
+        'search: for file in &diff.files {
             for hunk in &file.hunks {
                 for (line_index, line) in hunk.lines.iter().enumerate() {
                     if !matches!(
@@ -775,46 +816,76 @@ impl Inner {
                         continue;
                     }
                     let text = line.text();
-                    let found =
+                    let ranges =
                         crate::search::matcher::find_matches(&text, &query.text, case_sensitive);
-                    if found.is_empty() {
+                    if ranges.is_empty() {
                         continue;
                     }
-                    // Flash this match and stop: Ctrl+F walks the rest.
-                    let Some(target) = targets.get(hunk_index) else {
-                        return;
-                    };
-                    let flash_tag = search::flash_tag(&target.buffer);
-                    for (start, end) in found {
-                        let (Some(from), Some(to)) = (
-                            target
-                                .buffer
-                                .iter_at_line_offset(line_index as i32, start as i32),
-                            target
-                                .buffer
-                                .iter_at_line_offset(line_index as i32, end as i32),
-                        ) else {
-                            continue;
-                        };
-                        target.buffer.apply_tag(&flash_tag, &from, &to);
-                    }
-                    if let Some(iter) = target.buffer.iter_at_line_offset(line_index as i32, 0) {
-                        search::reveal_iter(&self.diff_scroll, target, &iter);
-                    }
-                    let buffer = target.buffer.clone();
-                    gtk4::glib::timeout_add_local_once(
-                        std::time::Duration::from_millis(1400),
-                        move || {
-                            let start = buffer.start_iter();
-                            let end = buffer.end_iter();
-                            buffer.remove_tag(&flash_tag, &start, &end);
-                        },
-                    );
-                    return;
+                    found = Some((
+                        folding::HunkFoldKey::from_hunk(file, hunk),
+                        line_index,
+                        ranges,
+                    ));
+                    break 'search;
                 }
-                hunk_index += 1;
             }
         }
+        let Some((key, line_index, ranges)) = found else {
+            return;
+        };
+        // Reveal the parents when the match is inside collapsed content
+        // (GITILANTE_DIFF_FOLDING_SPEC.md sections 30-31).
+        let mut targets = targets;
+        if !targets
+            .iter()
+            .any(|target| target.hunk.as_ref() == Some(&key))
+        {
+            let document = {
+                let state = self.state.borrow();
+                state
+                    .selection
+                    .as_ref()
+                    .and_then(folding::DiffDocumentKey::from_selection)
+            };
+            if let Some(document) = document {
+                self.folds
+                    .borrow_mut()
+                    .for_document(&document)
+                    .reveal_key(&key);
+            }
+            self.rerender_diff();
+            targets = self.state.borrow().render_targets.clone();
+        }
+        let Some(target) = targets
+            .iter()
+            .find(|target| target.hunk.as_ref() == Some(&key))
+        else {
+            return;
+        };
+        // Flash this match and stop: Ctrl+F walks the rest.
+        let flash_tag = search::flash_tag(&target.buffer);
+        for (start, end) in ranges {
+            let (Some(from), Some(to)) = (
+                target
+                    .buffer
+                    .iter_at_line_offset(line_index as i32, start as i32),
+                target
+                    .buffer
+                    .iter_at_line_offset(line_index as i32, end as i32),
+            ) else {
+                continue;
+            };
+            target.buffer.apply_tag(&flash_tag, &from, &to);
+        }
+        if let Some(iter) = target.buffer.iter_at_line_offset(line_index as i32, 0) {
+            search::reveal_iter(&self.diff_scroll, target, &iter);
+        }
+        let buffer = target.buffer.clone();
+        gtk4::glib::timeout_add_local_once(std::time::Duration::from_millis(1400), move || {
+            let start = buffer.start_iter();
+            let end = buffer.end_iter();
+            buffer.remove_tag(&flash_tag, &start, &end);
+        });
     }
 
     /// Selects a commit in the History and loads its diff through the normal
@@ -828,14 +899,20 @@ impl Inner {
     /// Toggles the folding of a file and re-renders keeping the viewport
     /// (GITILANTE_DIFF_FOLDING_SPEC.md sections 23-25).
     fn toggle_file_fold(&self, key: folding::FileFoldKey) {
-        self.with_fold_state(|state| state.toggle_file(key));
+        let focus = folding::FoldFocus::File(key.clone());
+        self.with_fold_state(focus, |state| state.toggle_file(key));
     }
 
     fn toggle_hunk_fold(&self, key: folding::HunkFoldKey) {
-        self.with_fold_state(|state| state.toggle_hunk(key));
+        let focus = folding::FoldFocus::Hunk(key.clone());
+        self.with_fold_state(focus, |state| state.toggle_hunk(key));
     }
 
-    fn with_fold_state(&self, apply: impl FnOnce(&mut folding::DiffFoldState)) {
+    fn with_fold_state(
+        &self,
+        focus: folding::FoldFocus,
+        apply: impl FnOnce(&mut folding::DiffFoldState),
+    ) {
         let document = {
             let state = self.state.borrow();
             state
@@ -847,7 +924,96 @@ impl Inner {
             return;
         };
         apply(self.folds.borrow_mut().for_document(&document));
+        // The focus lands on the toggled disclosure (section 26).
+        self.pending_focus.set(Some(focus));
         self.rerender_diff();
+    }
+
+    /// Applies a global folding action (GITILANTE_DIFF_FOLDING_SPEC.md §22).
+    fn fold_all(&self, action: folding::FoldAction) {
+        let Some((document, diff)) = self.current_document() else {
+            return;
+        };
+        self.folds
+            .borrow_mut()
+            .for_document(&document)
+            .apply(action, &diff);
+        self.rerender_diff();
+    }
+
+    /// The rendered document and its fold key
+    /// (GITILANTE_DIFF_FOLDING_SPEC.md sections 15 and 21).
+    fn current_document(&self) -> Option<(folding::DiffDocumentKey, Diff)> {
+        let state = self.state.borrow();
+        let selection = state.selection.as_ref()?;
+        let key = folding::DiffDocumentKey::from_selection(selection)?;
+        let diff = match selection {
+            Selection::Commit(oid) => {
+                let (_, diff) = state
+                    .commit_diff
+                    .as_ref()
+                    .filter(|(cached, _)| cached == oid)?;
+                diff.clone()
+            }
+            Selection::Staged(path) | Selection::Unstaged(path) | Selection::Conflicted(path) => {
+                let data = state.data.as_ref()?;
+                let side = match selection {
+                    Selection::Staged(_) => &data.staged,
+                    _ => &data.worktree,
+                };
+                Diff {
+                    files: vec![find_file(side, path)?.clone()],
+                }
+            }
+            _ => return None,
+        };
+        Some((key, diff))
+    }
+
+    /// Expands the collapsed elements whose text matches the query so the
+    /// local search finds hidden matches too (GITILANTE_DIFF_FOLDING_SPEC.md
+    /// sections 30-32).
+    fn reveal_hidden_matches(&self, query: &str) {
+        {
+            let mut last = self.last_reveal_query.borrow_mut();
+            if last.as_deref() == Some(query) {
+                return;
+            }
+            *last = Some(query.to_owned());
+        }
+        if query.is_empty() {
+            return;
+        }
+        let Some((document, diff)) = self.current_document() else {
+            return;
+        };
+        let case_sensitive = crate::search::matcher::is_case_sensitive(query);
+        let mut revealed = false;
+        {
+            let mut store = self.folds.borrow_mut();
+            let state = store.for_document(&document);
+            for file in &diff.files {
+                let file_key = folding::FileFoldKey::from_file(file);
+                for hunk in &file.hunks {
+                    let hunk_key = folding::HunkFoldKey::from_hunk(file, hunk);
+                    if !state.is_file_collapsed(&file_key) && !state.is_hunk_collapsed(&hunk_key) {
+                        continue;
+                    }
+                    let hit = hunk.lines.iter().any(|line| {
+                        !crate::search::matcher::find_matches(&line.text(), query, case_sensitive)
+                            .is_empty()
+                    });
+                    if hit {
+                        state.reveal_key(&hunk_key);
+                        revealed = true;
+                    }
+                }
+            }
+        }
+        // Section 32: revealed content stays revealed.
+        if revealed {
+            self.rerender_diff();
+        }
     }
 
     /// Re-renders the current diff keeping the viewport
@@ -876,6 +1042,30 @@ impl Inner {
 
     fn navigate_to_change(&self, result: &ChangeSearchResult) {
         self.search_dialog.close();
+        // Reveal the target even when it is collapsed
+        // (GITILANTE_DIFF_FOLDING_SPEC.md sections 30-31).
+        let hunk_key = {
+            let state = self.state.borrow();
+            let side = state.data.as_ref().map(|data| match result.side {
+                DiffSide::Staged => &data.staged,
+                _ => &data.worktree,
+            });
+            side.and_then(|diff| find_file(diff, &result.path))
+                .and_then(|file| {
+                    file.hunks
+                        .get(result.hunk_index)
+                        .map(|hunk| folding::HunkFoldKey::from_hunk(file, hunk))
+                })
+        };
+        if let (Some(key), Some(document)) = (
+            hunk_key.as_ref(),
+            folding::document_key_for_file(result.side, &result.path),
+        ) {
+            self.folds
+                .borrow_mut()
+                .for_document(&document)
+                .reveal_key(key);
+        }
         let selection = match result.side {
             DiffSide::Staged => Selection::Staged(result.path.clone()),
             _ => Selection::Unstaged(result.path.clone()),
@@ -887,7 +1077,11 @@ impl Inner {
         // Scroll to the matched line and flash it briefly (section 12).
         let target = {
             let state = self.state.borrow();
-            state.render_targets.get(result.hunk_index).cloned()
+            state
+                .render_targets
+                .iter()
+                .find(|target| target.hunk == hunk_key)
+                .cloned()
         };
         let Some(target) = target else {
             return;
@@ -975,6 +1169,7 @@ impl Inner {
     /// Rebuilds the diff pane for the current selection.
     fn render_diff(&self) {
         let mut state = self.state.borrow_mut();
+        let focus = self.pending_focus.take();
         // Focus tracking starts over with the new widgets.
         state.current_hunk = None;
         while let Some(child) = self.diff_box.first_child() {
@@ -992,19 +1187,30 @@ impl Inner {
                 diff_view::render_untracked(path, &self.diff_callbacks())
             }
             Some(Selection::Staged(path)) => match state.data.as_ref() {
-                Some(data) => self.render_file_diff(&data.staged, path, DiffSide::Staged),
+                Some(data) => {
+                    self.render_file_diff(&data.staged, path, DiffSide::Staged, focus.as_ref())
+                }
                 None => diff_view::RenderedDiff::plain(diff_view::placeholder("Loading…")),
             },
             Some(Selection::Unstaged(path)) => match state.data.as_ref() {
-                Some(data) => self.render_file_diff(&data.worktree, path, DiffSide::Unstaged),
+                Some(data) => {
+                    self.render_file_diff(&data.worktree, path, DiffSide::Unstaged, focus.as_ref())
+                }
                 None => diff_view::RenderedDiff::plain(diff_view::placeholder("Loading…")),
             },
             Some(Selection::Conflicted(path)) => match state.data.as_ref() {
-                Some(data) => self.render_file_diff(&data.worktree, path, DiffSide::Conflicted),
+                Some(data) => self.render_file_diff(
+                    &data.worktree,
+                    path,
+                    DiffSide::Conflicted,
+                    focus.as_ref(),
+                ),
                 None => diff_view::RenderedDiff::plain(diff_view::placeholder("Loading…")),
             },
             Some(Selection::Commit(oid)) => match &state.commit_diff {
-                Some((cached, diff)) if cached == oid => self.render_commit_diff(oid, diff),
+                Some((cached, diff)) if cached == oid => {
+                    self.render_commit_diff(oid, diff, focus.as_ref())
+                }
                 _ => diff_view::RenderedDiff::plain(diff_view::placeholder("Loading diff…")),
             },
             Some(Selection::FilePreview { path, line }) => match &state.file_preview {
@@ -1034,6 +1240,7 @@ impl Inner {
         diff: &Diff,
         path: &Path,
         side: DiffSide,
+        focus: Option<&folding::FoldFocus>,
     ) -> diff_view::RenderedDiff {
         match find_file(diff, path) {
             Some(file) => {
@@ -1051,7 +1258,14 @@ impl Inner {
                         }
                         None => &empty,
                     };
-                diff_view::render(file, side, &self.highlighter, folds, &self.diff_callbacks())
+                diff_view::render(
+                    file,
+                    side,
+                    &self.highlighter,
+                    folds,
+                    focus,
+                    &self.diff_callbacks(),
+                )
             }
             None => diff_view::RenderedDiff::plain(diff_view::placeholder(
                 "No diff available for this file",
@@ -1113,7 +1327,12 @@ impl Inner {
     }
 
     /// Renders every file of a commit diff with the same renderer (SPEC §17).
-    fn render_commit_diff(&self, oid: &str, diff: &Diff) -> diff_view::RenderedDiff {
+    fn render_commit_diff(
+        &self,
+        oid: &str,
+        diff: &Diff,
+        focus: Option<&folding::FoldFocus>,
+    ) -> diff_view::RenderedDiff {
         if diff.files.is_empty() {
             return diff_view::RenderedDiff::plain(diff_view::placeholder(
                 "No changes in this commit",
@@ -1131,6 +1350,7 @@ impl Inner {
                 DiffSide::History,
                 &self.highlighter,
                 folds,
+                focus,
                 &self.diff_callbacks(),
             );
             box_.append(&rendered.widget);

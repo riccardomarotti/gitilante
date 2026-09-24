@@ -19,7 +19,7 @@ use sourceview5::Language;
 use crate::syntax::Highlighter;
 
 use crate::model::diff::{DiffLineKind, DiffStats, FileDiff, Hunk};
-use crate::ui::folding::{DiffFoldState, FileFoldKey, HunkFoldKey};
+use crate::ui::folding::{DiffFoldState, FileFoldKey, FoldFocus, HunkFoldKey};
 use crate::ui::{DiffSide, HunkTarget, display_name};
 
 /// User actions available from the diff view.
@@ -55,6 +55,9 @@ pub struct Callbacks {
 pub struct SearchTarget {
     pub buffer: TextBuffer,
     pub view: TextView,
+    /// The hunk this target belongs to, for the search navigation
+    /// (GITILANTE_DIFF_FOLDING_SPEC.md section 30).
+    pub hunk: Option<HunkFoldKey>,
 }
 
 /// A rendered diff: its widget and its searchable text (one per hunk body).
@@ -79,6 +82,7 @@ pub fn render(
     side: DiffSide,
     highlighter: &Highlighter,
     folds: &DiffFoldState,
+    focus: Option<&FoldFocus>,
     callbacks: &Rc<Callbacks>,
 ) -> RenderedDiff {
     let root = GtkBox::new(Orientation::Vertical, 12);
@@ -87,7 +91,9 @@ pub fn render(
 
     let file_key = FileFoldKey::from_file(file);
     let collapsed = folds.is_file_collapsed(&file_key);
-    root.append(&file_header(file, side, collapsed, &file_key, callbacks));
+    root.append(&file_header(
+        file, side, collapsed, &file_key, focus, callbacks,
+    ));
 
     // A collapsed file renders its header only (GITILANTE_DIFF_FOLDING_SPEC.md
     // sections 3, 40 and 41).
@@ -125,6 +131,7 @@ pub fn render(
                 language.as_ref(),
                 highlighter,
                 folds.is_hunk_collapsed(&hunk_key),
+                focus,
                 callbacks,
             );
             root.append(&widget);
@@ -263,7 +270,11 @@ pub fn render_file_preview(
         )));
     }
 
-    let target = SearchTarget { buffer, view: body };
+    let target = SearchTarget {
+        buffer,
+        view: body,
+        hunk: None,
+    };
     RenderedDiff {
         widget: root.upcast(),
         targets: vec![target],
@@ -321,15 +332,20 @@ fn file_header(
     side: DiffSide,
     collapsed: bool,
     key: &FileFoldKey,
+    focus: Option<&FoldFocus>,
     callbacks: &Rc<Callbacks>,
 ) -> gtk4::Widget {
     let header = GtkBox::new(Orientation::Horizontal, 8);
 
-    header.append(&disclosure_button(collapsed, "file", {
+    let toggle = disclosure_button(collapsed, "file", {
         let callbacks = callbacks.clone();
         let key = key.clone();
         move || (callbacks.toggle_file)(key.clone())
-    }));
+    });
+    header.append(&toggle);
+    if matches!(focus, Some(FoldFocus::File(focused)) if focused == key) {
+        toggle.grab_focus();
+    }
 
     let name = Label::new(Some(&display_name(
         file.path().unwrap_or_else(|| std::path::Path::new("")),
@@ -378,6 +394,8 @@ fn file_header(
 }
 
 /// One hunk block: header with actions, then the hunk body.
+/// One hunk: its collapsible header and, when expanded, its body.
+#[allow(clippy::too_many_arguments)]
 fn hunk_view(
     file: &FileDiff,
     hunk: &Hunk,
@@ -385,6 +403,7 @@ fn hunk_view(
     language: Option<&Language>,
     highlighter: &Highlighter,
     collapsed: bool,
+    focus: Option<&FoldFocus>,
     callbacks: &Rc<Callbacks>,
 ) -> (gtk4::Widget, Option<SearchTarget>) {
     let block = GtkBox::new(Orientation::Vertical, 4);
@@ -396,11 +415,15 @@ fn hunk_view(
 
     let header = GtkBox::new(Orientation::Horizontal, 8);
     let key = HunkFoldKey::from_hunk(file, hunk);
-    header.append(&disclosure_button(collapsed, "hunk", {
+    let toggle = disclosure_button(collapsed, "hunk", {
         let callbacks = callbacks.clone();
         let key = key.clone();
         move || (callbacks.toggle_hunk)(key.clone())
-    }));
+    });
+    header.append(&toggle);
+    if matches!(focus, Some(FoldFocus::Hunk(focused)) if focused == &key) {
+        toggle.grab_focus();
+    }
 
     let header_label = Label::new(Some(&hunk.header_text()));
     header_label.add_css_class("monospace");
@@ -489,7 +512,8 @@ fn hunk_view(
         return (block.upcast(), None);
     }
 
-    let (body, search_target) = hunk_body(hunk, language, highlighter);
+    let (body, mut search_target) = hunk_body(hunk, language, highlighter);
+    search_target.hunk = Some(key);
     track_focus(&body, &target, callbacks);
     block.append(&body);
     (block.upcast(), Some(search_target))
@@ -682,7 +706,11 @@ fn hunk_body(
     box_.add_css_class("frame");
     box_.append(&gutter_view);
     box_.append(&body);
-    let search_target = SearchTarget { buffer, view: body };
+    let search_target = SearchTarget {
+        buffer,
+        view: body,
+        hunk: None,
+    };
     (box_.upcast(), search_target)
 }
 

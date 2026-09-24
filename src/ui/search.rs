@@ -60,6 +60,8 @@ struct Shared {
     regex: Cell<bool>,
     /// Told when the bar gains/loses the keyboard focus.
     on_focus: Box<dyn Fn(bool)>,
+    /// Asked to reveal collapsed content hiding matches (sections 30-32).
+    on_query: Box<dyn Fn(&str)>,
 }
 
 /// The search bar shown above the diff panel.
@@ -74,7 +76,11 @@ impl SearchBar {
     /// `on_focus` is called with `true` when the bar takes the keyboard focus
     /// and with `false` when it closes: single-key shortcuts must not intercept
     /// typing (GITILANTE_SEARCH_SPEC.md section 51).
-    pub fn new(scrolled: ScrolledWindow, on_focus: Box<dyn Fn(bool)>) -> Self {
+    pub fn new(
+        scrolled: ScrolledWindow,
+        on_focus: Box<dyn Fn(bool)>,
+        on_query: Box<dyn Fn(&str)>,
+    ) -> Self {
         let root = GtkBox::new(Orientation::Horizontal, 6);
         root.set_margin_top(6);
         root.set_margin_bottom(6);
@@ -116,6 +122,7 @@ impl SearchBar {
             query: RefCell::new(String::new()),
             regex: Cell::new(false),
             on_focus,
+            on_query,
         });
 
         {
@@ -243,6 +250,12 @@ fn refresh(shared: &Rc<Shared>) {
     clear_highlight(shared);
     let query = shared.query.borrow().clone();
     let case_sensitive = is_case_sensitive(&query);
+
+    // Reveal collapsed content hiding matches before scanning
+    // (GITILANTE_DIFF_FOLDING_SPEC.md sections 30-32).
+    if !query.is_empty() {
+        (shared.on_query)(&query);
+    }
 
     let mut matches = Vec::new();
     let mut error = None;

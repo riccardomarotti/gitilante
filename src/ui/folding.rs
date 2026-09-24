@@ -121,9 +121,23 @@ impl DiffFoldState {
     /// Reveals a file and a hunk for the search navigation
     /// (GITILANTE_DIFF_FOLDING_SPEC.md sections 30-31).
     pub fn reveal_hunk(&mut self, file: &FileDiff, hunk: &Hunk) {
-        self.collapsed_files.remove(&FileFoldKey::from_file(file));
-        self.collapsed_hunks
-            .remove(&HunkFoldKey::from_hunk(file, hunk));
+        self.reveal_key(&HunkFoldKey::from_hunk(file, hunk));
+    }
+
+    /// Reveals a hunk and its file by key.
+    pub fn reveal_key(&mut self, key: &HunkFoldKey) {
+        self.collapsed_files.remove(&key.file);
+        self.collapsed_hunks.remove(key);
+    }
+
+    /// Applies a global action (GITILANTE_DIFF_FOLDING_SPEC.md section 22).
+    pub fn apply(&mut self, action: FoldAction, diff: &Diff) {
+        match action {
+            FoldAction::CollapseAllFiles => self.collapse_all_files(diff),
+            FoldAction::ExpandAllFiles => self.expand_all_files(diff),
+            FoldAction::CollapseAllHunks => self.collapse_all_hunks(diff),
+            FoldAction::ExpandAllHunks => self.expand_all_hunks(diff),
+        }
     }
 
     /// Forgets the keys that no longer exist in `diff`
@@ -142,6 +156,23 @@ impl DiffFoldState {
         self.collapsed_files.retain(|key| files.contains(key));
         self.collapsed_hunks.retain(|key| hunks.contains(key));
     }
+}
+
+/// The global folding actions (GITILANTE_DIFF_FOLDING_SPEC.md sections 21-22).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FoldAction {
+    CollapseAllFiles,
+    ExpandAllFiles,
+    CollapseAllHunks,
+    ExpandAllHunks,
+}
+
+/// A collapsible element: where to restore the focus after a toggle
+/// (GITILANTE_DIFF_FOLDING_SPEC.md section 26).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FoldFocus {
+    File(FileFoldKey),
+    Hunk(HunkFoldKey),
 }
 
 /// Which rendered document a fold state belongs to
