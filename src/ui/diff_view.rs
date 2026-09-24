@@ -6,7 +6,7 @@
 //! deletions keep their `+`/`-` markers and get a light background tint.
 
 use std::cell::RefCell;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use gtk4::gdk;
@@ -20,11 +20,14 @@ use sourceview5::Language;
 use crate::syntax::Highlighter;
 
 use crate::model::diff::{DiffLineKind, DiffStats, FileDiff, Hunk};
+use crate::ui::clipboard::{self, CopyAction};
 use crate::ui::folding::{DiffFoldState, FileFoldKey, FoldFocus, HunkFoldKey};
 use crate::ui::{DiffSide, HunkTarget, display_name};
 
 /// User actions available from the diff view.
 pub struct Callbacks {
+    /// Copy an existing model payload to the clipboard.
+    pub copy: Box<dyn Fn(CopyAction)>,
     /// Stage one hunk of a working tree diff.
     pub stage_hunk: Box<dyn Fn(FileDiff, Hunk)>,
     /// Unstage one hunk of a staged diff.
@@ -210,6 +213,25 @@ pub fn render_file_preview(
     hint.add_css_class("dim-label");
     hint.add_css_class("caption");
     header.append(&hint);
+    let path_for_copy = path.to_path_buf();
+    let absolute_path = path.to_path_buf();
+    let copy_callbacks = callbacks.clone();
+    let absolute_callbacks = callbacks.clone();
+    clipboard::context_menu(
+        &header,
+        vec![
+            (
+                "Copy path",
+                Box::new(move || (copy_callbacks.copy)(CopyAction::Path(path_for_copy.clone()))),
+            ),
+            (
+                "Copy absolute path",
+                Box::new(move || {
+                    (absolute_callbacks.copy)(CopyAction::AbsolutePath(absolute_path.clone()))
+                }),
+            ),
+        ],
+    );
     if tracked {
         let history = file_button("History", {
             let path = path.to_path_buf();
@@ -334,6 +356,7 @@ fn disclosure_button(collapsed: bool, what: &str, on_toggle: impl Fn() + 'static
 /// (GITILANTE_DIFF_FOLDING_SPEC.md section 7). A drag still selects the text.
 fn attach_toggle_gesture(label: &Label, on_toggle: impl Fn() + 'static) {
     let gesture = gtk4::GestureClick::new();
+    gesture.set_button(gdk::BUTTON_PRIMARY);
     gesture.connect_released(move |_, _, _, _| on_toggle());
     label.add_controller(gesture);
 }
@@ -394,6 +417,39 @@ fn file_header(
         });
         history.set_tooltip_text(Some("Show history of this file"));
         header.append(&history);
+    }
+    if !matches!(side, DiffSide::Conflicted) {
+        let path = file.path().map(Path::to_path_buf);
+        let absolute_path = path.clone();
+        let file_for_diff = file.clone();
+        let copy_path = callbacks.clone();
+        let copy_absolute = callbacks.clone();
+        let copy_diff = callbacks.clone();
+        clipboard::context_menu(
+            &header,
+            vec![
+                (
+                    "Copy path",
+                    Box::new(move || {
+                        if let Some(path) = &path {
+                            (copy_path.copy)(CopyAction::Path(path.clone()));
+                        }
+                    }),
+                ),
+                (
+                    "Copy absolute path",
+                    Box::new(move || {
+                        if let Some(path) = &absolute_path {
+                            (copy_absolute.copy)(CopyAction::AbsolutePath(path.clone()));
+                        }
+                    }),
+                ),
+                (
+                    "Copy diff",
+                    Box::new(move || (copy_diff.copy)(CopyAction::FileDiff(file_for_diff.clone()))),
+                ),
+            ],
+        );
     }
     match side {
         DiffSide::Staged => {
@@ -532,6 +588,20 @@ fn hunk_view(
         }
         // Conflicted files are read-only (SPEC sections 25 and 31).
         DiffSide::Conflicted => {}
+    }
+    if !matches!(side, DiffSide::Conflicted) {
+        let file = file.clone();
+        let hunk = hunk.clone();
+        let callbacks = callbacks.clone();
+        clipboard::context_menu(
+            &header,
+            vec![(
+                "Copy hunk diff",
+                Box::new(move || {
+                    (callbacks.copy)(CopyAction::HunkDiff(file.clone(), hunk.clone()));
+                }),
+            )],
+        );
     }
     block.append(&header);
 

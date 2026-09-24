@@ -16,10 +16,12 @@ use gtk4::{Box as GtkBox, Button, Label, ListBox, ListBoxRow, Orientation, Selec
 use crate::graph::{GraphRow, HistoryGraph};
 use crate::model::commit::Commit;
 use crate::model::refs::{CommitRef, HeadRef, RefKind};
+use crate::ui::clipboard::{self, CopyAction};
 use crate::ui::{Selection, graph_gutter};
 
 /// User actions available from the History list.
 pub struct Callbacks {
+    pub copy: Box<dyn Fn(CopyAction)>,
     /// A commit was selected.
     pub select: Box<dyn Fn(Selection)>,
     /// The user asked for the next block of commits.
@@ -165,6 +167,7 @@ impl HistoryView {
         }
         self.shared.rebuilding.set(true);
         while let Some(row) = self.list.row_at_index(0) {
+            clipboard::detach_context_menu(&row);
             self.list.remove(&row);
         }
         let mut items = self.shared.items.borrow_mut();
@@ -263,6 +266,27 @@ impl HistoryView {
 
         outer.append(&box_);
         row.set_child(Some(&outer));
+        let sha = commit.clone();
+        let info = commit.clone();
+        let shared_for_sha = self.shared.clone();
+        let shared_for_info = self.shared.clone();
+        clipboard::context_menu(
+            &row,
+            vec![
+                (
+                    "Copy commit SHA",
+                    Box::new(move || {
+                        (shared_for_sha.callbacks.copy)(CopyAction::CommitSha(sha.clone()))
+                    }),
+                ),
+                (
+                    "Copy commit info",
+                    Box::new(move || {
+                        (shared_for_info.callbacks.copy)(CopyAction::CommitInfo(info.clone()))
+                    }),
+                ),
+            ],
+        );
         self.list.append(&row);
     }
 

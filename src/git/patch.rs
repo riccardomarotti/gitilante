@@ -58,18 +58,36 @@ pub fn apply(root: &Path, patch: &[u8], target: ApplyTarget, reverse: bool) -> R
 /// verbatim, then the selected hunk, so it applies exactly like the original
 /// diff while touching only that hunk.
 pub fn single_hunk_patch(file: &FileDiff, hunk: &Hunk) -> Vec<u8> {
+    let mut patch = patch_header(file);
+    append_hunk(&mut patch, hunk);
+    patch
+}
+
+/// The full raw patch for one file, independent of folding and rendering.
+pub fn file_patch(file: &FileDiff) -> Vec<u8> {
+    let mut patch = patch_header(file);
+    for hunk in &file.hunks {
+        append_hunk(&mut patch, hunk);
+    }
+    patch
+}
+
+fn patch_header(file: &FileDiff) -> Vec<u8> {
     let mut patch = Vec::new();
     push_line(&mut patch, &file.header);
     for line in &file.metadata {
         push_line(&mut patch, line);
     }
-    push_line(&mut patch, &hunk.header);
+    patch
+}
+
+fn append_hunk(patch: &mut Vec<u8>, hunk: &Hunk) {
+    push_line(patch, &hunk.header);
     for line in &hunk.lines {
         patch.push(marker(line.kind));
         patch.extend_from_slice(&line.content);
         patch.push(b'\n');
     }
-    patch
 }
 
 /// Only ordinary modified text hunks are safe for partial application.
@@ -143,11 +161,7 @@ pub fn selected_lines_patch_for_direction(
         lines.push((kind, &line.content));
     }
 
-    let mut patch = Vec::new();
-    push_line(&mut patch, &file.header);
-    for line in &file.metadata {
-        push_line(&mut patch, line);
-    }
+    let mut patch = patch_header(file);
     push_line(
         &mut patch,
         format!(
@@ -177,4 +191,34 @@ fn marker(kind: DiffLineKind) -> u8 {
 fn push_line(patch: &mut Vec<u8>, line: &[u8]) {
     patch.extend_from_slice(line);
     patch.push(b'\n');
+}
+
+#[cfg(test)]
+mod copy_tests {
+    use super::*;
+
+    #[test]
+    fn copies_all_hunks_without_gutter_or_rendering() {
+        let raw = b"diff --git a/a.txt b/a.txt\nindex 111..222 100644\n--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-old\n+new\n@@ -10 +10 @@\n-left\n+right\n";
+        let diff = crate::git::diff::parse(raw).unwrap();
+        assert_eq!(file_patch(&diff.files[0]), raw);
+        let hunk = single_hunk_patch(&diff.files[0], &diff.files[0].hunks[1]);
+        assert!(!String::from_utf8_lossy(&hunk).contains("-old"));
+        assert!(String::from_utf8_lossy(&hunk).contains("+right"));
+    }
+
+    #[test]
+    fn preserves_special_headers_and_no_newline_marker() {
+        for raw in [
+            b"diff --git a/a b/a\nnew file mode 100644\n--- /dev/null\n+++ b/a\n@@ -0,0 +1 @@\n+x\n".as_slice(),
+            b"diff --git a/a b/a\ndeleted file mode 100644\n--- a/a\n+++ /dev/null\n@@ -1 +0,0 @@\n-x\n",
+            b"diff --git a/a b/b\nsimilarity index 100%\nrename from a\nrename to b\n",
+            b"diff --git a/a b/a\nold mode 100644\nnew mode 100755\n",
+            b"diff --git a/a b/a\nindex 111..222 100644\nBinary files a/a and b/a differ\n",
+            b"diff --git a/a b/a\n--- a/a\n+++ b/a\n@@ -1 +1 @@\n-old\n\\ No newline at end of file\n+new\n\\ No newline at end of file\n",
+        ] {
+            let diff = crate::git::diff::parse(raw).unwrap();
+            assert_eq!(file_patch(&diff.files[0]), raw);
+        }
+    }
 }

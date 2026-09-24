@@ -12,10 +12,12 @@ use gtk4::prelude::*;
 use gtk4::{Align, Box as GtkBox, Button, Label, ListBox, ListBoxRow, Orientation, SelectionMode};
 
 use crate::model::status::{Status, StatusEntry};
+use crate::ui::clipboard::{self, CopyAction};
 use crate::ui::{Selection, change_letter, display_name};
 
 /// User actions available from the sidebar.
 pub struct Callbacks {
+    pub copy: Box<dyn Fn(CopyAction)>,
     /// A row was selected.
     pub select: Box<dyn Fn(Selection)>,
     /// Stage every change of the given path.
@@ -96,6 +98,7 @@ impl ChangesView {
     pub fn update(&self, status: &Status, selection: Option<&Selection>) {
         self.shared.rebuilding.set(true);
         while let Some(row) = self.list.row_at_index(0) {
+            clipboard::detach_context_menu(&row);
             self.list.remove(&row);
         }
         let mut items = self.shared.items.borrow_mut();
@@ -216,6 +219,27 @@ impl ChangesView {
         }
 
         row.set_child(Some(&box_));
+        let path = entry.path.clone();
+        let absolute_path = path.clone();
+        let shared = self.shared.clone();
+        let absolute_shared = self.shared.clone();
+        clipboard::context_menu(
+            &row,
+            vec![
+                (
+                    "Copy path",
+                    Box::new(move || (shared.callbacks.copy)(CopyAction::Path(path.clone()))),
+                ),
+                (
+                    "Copy absolute path",
+                    Box::new(move || {
+                        (absolute_shared.callbacks.copy)(CopyAction::AbsolutePath(
+                            absolute_path.clone(),
+                        ))
+                    }),
+                ),
+            ],
+        );
         self.list.append(&row);
     }
 }

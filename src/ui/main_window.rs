@@ -35,8 +35,8 @@ use crate::search::result::{
 };
 use crate::ui::worker::Worker;
 use crate::ui::{
-    DiffSide, HunkTarget, Selection, changes, conflict_view, diff_view, folding, history, search,
-    search_dialog, short_path,
+    DiffSide, HunkTarget, Selection, changes, clipboard, conflict_view, diff_view, folding,
+    history, search, search_dialog, short_path,
 };
 
 /// Commits per history block (SPEC section 16).
@@ -216,6 +216,7 @@ impl Inner {
         header.pack_end(&spinner);
 
         let changes = changes::ChangesView::new(changes::Callbacks {
+            copy: op_callback(&self_weak, Inner::copy_action),
             select: {
                 let weak = self_weak.clone();
                 Box::new(move |selection| {
@@ -238,6 +239,7 @@ impl Inner {
         });
 
         let history_view = history::HistoryView::new(history::Callbacks {
+            copy: op_callback(&self_weak, Inner::copy_action),
             select: {
                 let weak = self_weak.clone();
                 Box::new(move |selection| {
@@ -454,9 +456,17 @@ impl Inner {
             let weak = self_weak.clone();
             window.connect_is_active_notify(move |window| {
                 if window.is_active() {
-                    if let Some(inner) = weak.upgrade() {
-                        inner.refresh();
-                    }
+                    // Popups can change activation during the same event that
+                    // maps them. Wait until that event finishes before deciding
+                    // whether this was a real return to the application.
+                    let weak = weak.clone();
+                    gtk4::glib::idle_add_local_once(move || {
+                        if let Some(inner) = weak.upgrade() {
+                            if inner.window.is_active() && !clipboard::menu_is_open() {
+                                inner.refresh();
+                            }
+                        }
+                    });
                 }
             });
         }
@@ -1914,6 +1924,7 @@ impl Inner {
     fn diff_callbacks(&self) -> Rc<diff_view::Callbacks> {
         let weak = self.self_weak.clone();
         Rc::new(diff_view::Callbacks {
+            copy: op_callback(&weak, Inner::copy_action),
             stage_hunk: op2_callback(&weak, Inner::stage_hunk),
             unstage_hunk: op2_callback(&weak, Inner::unstage_hunk),
             discard_hunk: {
@@ -1979,6 +1990,17 @@ impl Inner {
                 })
             },
         })
+    }
+
+    // --- clipboard -------------------------------------------------------
+
+    fn copy_action(&self, action: clipboard::CopyAction) {
+        let message = match clipboard::copy(action, self.repo.root()) {
+            Ok(message) | Err(message) => message,
+        };
+        let toast = adw::Toast::new(message);
+        toast.set_timeout(3);
+        self.toast_overlay.add_toast(toast);
     }
 
     // --- operations ------------------------------------------------------
