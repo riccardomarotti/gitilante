@@ -1526,6 +1526,7 @@ impl Inner {
                     &session.borrow(),
                     &self.highlighter,
                     &self.conflict_callbacks(),
+                    self.window.width(),
                 ),
                 None => match state.conflict_errors.get(path) {
                     Some(message) => {

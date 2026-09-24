@@ -787,7 +787,7 @@ fn addition_background() -> gdk::RGBA {
     gdk::RGBA::new(0.20, 0.60, 0.30, 0.18)
 }
 
-fn addition_strong_background() -> gdk::RGBA {
+pub(crate) fn addition_strong_background() -> gdk::RGBA {
     gdk::RGBA::new(0.20, 0.60, 0.30, 0.38)
 }
 
@@ -795,7 +795,7 @@ fn deletion_background() -> gdk::RGBA {
     gdk::RGBA::new(0.85, 0.30, 0.30, 0.18)
 }
 
-fn deletion_strong_background() -> gdk::RGBA {
+pub(crate) fn deletion_strong_background() -> gdk::RGBA {
     gdk::RGBA::new(0.85, 0.30, 0.30, 0.38)
 }
 
@@ -816,7 +816,7 @@ fn new_tag_dim(buffer: &TextBuffer) -> gtk4::TextTag {
 
 /// Overlay tag for the strong intraline spans: the background covers the text
 /// extent only, on top of the line background (COLORS.md section 28).
-fn new_tag_strong(buffer: &TextBuffer, background: gdk::RGBA) -> gtk4::TextTag {
+pub(crate) fn new_tag_strong(buffer: &TextBuffer, background: gdk::RGBA) -> gtk4::TextTag {
     buffer
         .create_tag(None::<&str>, &[("background-rgba", &background)])
         .expect("create text tag")

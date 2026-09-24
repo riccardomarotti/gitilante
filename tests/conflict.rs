@@ -483,3 +483,27 @@ fn clean_path_reports_no_conflict() {
     let backend = Backend::discover(Path::new(repo.root())).unwrap();
     assert_eq!(backend.conflict(Path::new("file.txt")).unwrap(), None);
 }
+
+/// §31 — near-identical lines get intraline marks on both sides.
+#[test]
+fn intraline_marks_highlight_the_changed_parts() {
+    use gitilante::conflict::presentation::intraline_marks;
+
+    let (marks_a, marks_b) = intraline_marks(b"timeout = 10\n", b"timeout = 30\n");
+    assert_eq!(marks_a.len(), 1);
+    assert_eq!(marks_b.len(), 1);
+    for marks in [&marks_a, &marks_b] {
+        assert!(!marks[0].is_empty());
+        // The changed digits live inside "10" / "30" (columns 10..12).
+        assert!(
+            marks[0]
+                .iter()
+                .all(|(start, end)| *start >= 10 && *end <= 12)
+        );
+    }
+
+    // Completely different lines get no pairing at all (§31).
+    let (marks_a, marks_b) = intraline_marks(b"alpha\n", b"1234567890 qwerty asdfgh zxcv\n");
+    assert!(marks_a.iter().all(|spans| spans.is_empty()));
+    assert!(marks_b.iter().all(|spans| spans.is_empty()));
+}

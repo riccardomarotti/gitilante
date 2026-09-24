@@ -14,7 +14,7 @@ use gtk4::{Box as GtkBox, Button, Label, Orientation, TextBuffer, TextView, Wrap
 
 use crate::conflict::context::ConflictContext;
 use crate::conflict::model::ConflictBlock;
-use crate::conflict::presentation::{ConflictPresentation, ConflictSide};
+use crate::conflict::presentation::{ConflictPresentation, ConflictSide, intraline_marks};
 use crate::conflict::resolution::ConflictResolution;
 use crate::git::conflict::ConflictLoad;
 use crate::syntax::Highlighter;
@@ -117,18 +117,23 @@ pub struct Callbacks {
 }
 
 /// Renders the solver for the session.
+///
+/// `window_width` drives the responsive layout: wide windows show the two
+/// sources side by side, narrow ones stack them (§32).
 pub fn render(
     session: &ConflictSession,
     highlighter: &Highlighter,
     callbacks: &Rc<Callbacks>,
+    window_width: i32,
 ) -> RenderedDiff {
+    let wide = window_width >= WIDE_LAYOUT_MIN_WIDTH;
     let root = GtkBox::new(Orientation::Vertical, 12);
     diff_view::set_margins(&root, 12);
     root.append(&header(session));
 
     let targets = match &session.load.presentation {
         ConflictPresentation::TextBlocks(file) => {
-            let (widget, targets) = blocks_view(session, file, highlighter, callbacks);
+            let (widget, targets) = blocks_view(session, file, highlighter, callbacks, wide);
             root.append(&widget);
             targets
         }
@@ -180,12 +185,16 @@ fn counter_text(total: usize, resolved: usize) -> String {
     format!("{total} conflicts · {resolved} resolved")
 }
 
+/// Minimum window width for the side-by-side layout (§32).
+const WIDE_LAYOUT_MIN_WIDTH: i32 = 1100;
+
 /// All conflict blocks with the counter, navigation and final apply (§33-38).
 fn blocks_view(
     session: &ConflictSession,
     file: &crate::conflict::ConflictFile,
     highlighter: &Highlighter,
     callbacks: &Rc<Callbacks>,
+    wide: bool,
 ) -> (gtk4::Widget, Vec<SearchTarget>) {
     let root = GtkBox::new(Orientation::Vertical, 12);
     let mut targets = Vec::new();
@@ -218,6 +227,7 @@ fn blocks_view(
             total,
             &counter,
             &apply_button,
+            wide,
         );
         block_buttons.borrow_mut().push(status_button);
         root.append(&widget);
@@ -273,6 +283,7 @@ fn block_view(
     total: usize,
     counter: &Label,
     apply_button: &Button,
+    wide: bool,
 ) -> (gtk4::Widget, Vec<SearchTarget>, Button) {
     let root = GtkBox::new(Orientation::Vertical, 6);
     let mut targets = Vec::new();
@@ -303,12 +314,38 @@ fn block_view(
     }
     root.append(&status_button);
 
-    // Source panels with the operation-aware labels (§5-9, §32).
-    for (title, content) in [(&labels.a, &block.source_a), (&labels.b, &block.source_b)] {
-        let (panel, target) = source_panel(title, content, &session.path, highlighter);
-        body.append(&panel);
-        targets.push(target);
-    }
+    // Source panels with the operation-aware labels (§5-9); near-identical
+    // lines get intraline marks (§31) and wide windows a two-column layout (§32).
+    let (marks_a, marks_b) = intraline_marks(&block.source_a, &block.source_b);
+    let panels = GtkBox::new(
+        if wide {
+            Orientation::Horizontal
+        } else {
+            Orientation::Vertical
+        },
+        8,
+    );
+    let (panel_a, target_a) = source_panel(
+        &labels.a,
+        &block.source_a,
+        &session.path,
+        highlighter,
+        &marks_a,
+        Some(diff_view::deletion_strong_background()),
+    );
+    let (panel_b, target_b) = source_panel(
+        &labels.b,
+        &block.source_b,
+        &session.path,
+        highlighter,
+        &marks_b,
+        Some(diff_view::addition_strong_background()),
+    );
+    panels.append(&panel_a);
+    panels.append(&panel_b);
+    body.append(&panels);
+    targets.push(target_a);
+    targets.push(target_b);
 
     // Actions with the operation-aware wording (§23-24).
     let actions = GtkBox::new(Orientation::Horizontal, 8);
@@ -379,7 +416,8 @@ fn block_view(
         });
         base_button.add_css_class("flat");
         base_button.set_halign(gtk4::Align::Start);
-        let (base_panel, base_target) = source_panel("BASE", base, &session.path, highlighter);
+        let (base_panel, base_target) =
+            source_panel("BASE", base, &session.path, highlighter, &[], None);
         base_panel.set_visible(session.base_visible[index]);
         {
             let base_panel = base_panel.clone();
@@ -491,8 +529,11 @@ fn source_panel(
     content: &[u8],
     path: &Path,
     highlighter: &Highlighter,
+    marks: &[Vec<(usize, usize)>],
+    strong: Option<gtk4::gdk::RGBA>,
 ) -> (gtk4::Widget, SearchTarget) {
     let root = GtkBox::new(Orientation::Vertical, 2);
+    root.set_hexpand(true);
     let caption = Label::new(Some(title));
     caption.add_css_class("caption");
     caption.add_css_class("dim-label");
@@ -502,6 +543,21 @@ fn source_panel(
     let text = String::from_utf8_lossy(content);
     let lines: Vec<String> = text.lines().map(str::to_owned).collect();
     let buffer = highlighted_buffer(path, &lines, highlighter);
+    if let Some(color) = strong {
+        // Strong intraline background on top of the syntax styles (§31).
+        let tag = diff_view::new_tag_strong(&buffer, color);
+        for (row, spans) in marks.iter().enumerate() {
+            for (start, end) in spans {
+                diff_view::apply_range(
+                    &buffer,
+                    row as i32,
+                    *start,
+                    *end,
+                    std::slice::from_ref(&tag),
+                );
+            }
+        }
+    }
     let view = TextView::with_buffer(&buffer);
     view.set_editable(false);
     view.set_cursor_visible(false);
@@ -620,7 +676,8 @@ fn file_level_view(
             root.append(&hint_label(&format!(
                 "One side deleted this file. The version below comes from {owner}."
             )));
-            let (panel, target) = source_panel(owner, content, &session.path, highlighter);
+            let (panel, target) =
+                source_panel(owner, content, &session.path, highlighter, &[], None);
             root.append(&panel);
             targets.push(target);
             append_file_actions(
@@ -651,8 +708,14 @@ fn file_level_view(
             ));
             for (title, version) in [(&labels.a, version_a), (&labels.b, version_b)] {
                 let caption = format!("{} · {} bytes", title, version.bytes.len());
-                let (panel, target) =
-                    source_panel(&caption, &version.bytes, &session.path, highlighter);
+                let (panel, target) = source_panel(
+                    &caption,
+                    &version.bytes,
+                    &session.path,
+                    highlighter,
+                    &[],
+                    None,
+                );
                 root.append(&panel);
                 targets.push(target);
             }
@@ -687,6 +750,8 @@ fn file_level_view(
                     text.as_bytes(),
                     &session.path,
                     highlighter,
+                    &[],
+                    None,
                 );
                 root.append(&panel);
                 targets.push(target);

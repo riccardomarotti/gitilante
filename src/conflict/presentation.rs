@@ -154,3 +154,30 @@ pub fn classify(
         (false, false) => ResolveAsDeleted,
     }
 }
+
+/// Per-line changed ranges for the intraline comparison of two alternatives.
+pub type LineMarks = Vec<Vec<(usize, usize)>>;
+
+/// Compares the two alternatives line by line for §31.
+///
+/// Reuses the pairing rules of the diff intraline engine: lines without a
+/// convincing counterpart get no marks at all, so plain syntax-highlighted
+/// text is preferred over a wrong pairing.
+pub fn intraline_marks(source_a: &[u8], source_b: &[u8]) -> (LineMarks, LineMarks) {
+    let text_a = String::from_utf8_lossy(source_a);
+    let text_b = String::from_utf8_lossy(source_b);
+    let lines_a: Vec<&str> = text_a.lines().collect();
+    let lines_b: Vec<&str> = text_b.lines().collect();
+    let mut marks_a = vec![Vec::new(); lines_a.len()];
+    let mut marks_b = vec![Vec::new(); lines_b.len()];
+    for pair in crate::intraline::pair_lines(&lines_a, &lines_b) {
+        let spans = crate::intraline::string_intraline(lines_a[pair.removed], lines_b[pair.added]);
+        for span in &spans.old {
+            marks_a[pair.removed].push((span.start, span.end));
+        }
+        for span in &spans.new {
+            marks_b[pair.added].push((span.start, span.end));
+        }
+    }
+    (marks_a, marks_b)
+}
