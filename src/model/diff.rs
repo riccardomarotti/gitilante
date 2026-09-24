@@ -55,6 +55,17 @@ impl FileDiff {
     pub fn header_text(&self) -> Cow<'_, str> {
         String::from_utf8_lossy(&self.header)
     }
+
+    /// Added/removed line counts (GITILANTE_DIFF_FOLDING_SPEC.md section 10).
+    pub fn stats(&self) -> DiffStats {
+        let mut stats = DiffStats::default();
+        for hunk in &self.hunks {
+            let hunk_stats = hunk.stats();
+            stats.additions += hunk_stats.additions;
+            stats.deletions += hunk_stats.deletions;
+        }
+        stats
+    }
 }
 
 /// Kind of change of a file.
@@ -96,6 +107,27 @@ impl Hunk {
     pub fn header_text(&self) -> Cow<'_, str> {
         String::from_utf8_lossy(&self.header)
     }
+
+    /// Added/removed line counts (GITILANTE_DIFF_FOLDING_SPEC.md section 10).
+    pub fn stats(&self) -> DiffStats {
+        let mut stats = DiffStats::default();
+        for line in &self.lines {
+            match line.kind {
+                DiffLineKind::Addition => stats.additions += 1,
+                DiffLineKind::Deletion => stats.deletions += 1,
+                _ => {}
+            }
+        }
+        stats
+    }
+}
+
+/// Added/removed line counts, computed from the parsed diff only
+/// (GITILANTE_DIFF_FOLDING_SPEC.md section 10).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DiffStats {
+    pub additions: usize,
+    pub deletions: usize,
 }
 
 /// A changed part of a line.

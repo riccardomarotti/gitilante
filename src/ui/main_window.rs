@@ -31,7 +31,8 @@ use crate::search::result::{
 };
 use crate::ui::worker::Worker;
 use crate::ui::{
-    DiffSide, HunkTarget, Selection, changes, diff_view, history, search, search_dialog, short_path,
+    DiffSide, HunkTarget, Selection, changes, diff_view, folding, history, search, search_dialog,
+    short_path,
 };
 
 /// Commits per history block (SPEC section 16).
@@ -97,6 +98,8 @@ struct Inner {
     busy: Cell<u32>,
     /// Shared syntax highlighting resources (COLORS.md section 49).
     highlighter: crate::syntax::Highlighter,
+    /// Folding state of the rendered diffs (GITILANTE_DIFF_FOLDING_SPEC.md §15).
+    folds: RefCell<folding::FoldStateStore>,
     self_weak: Weak<Inner>,
     window: adw::ApplicationWindow,
     toast_overlay: adw::ToastOverlay,
@@ -364,6 +367,7 @@ impl Inner {
             state: RefCell::new(State::default()),
             busy: Cell::new(0),
             highlighter: crate::syntax::Highlighter::new(),
+            folds: RefCell::new(folding::FoldStateStore::default()),
             self_weak,
             window,
             toast_overlay,
@@ -821,6 +825,42 @@ impl Inner {
         self.select(Selection::Commit(oid.to_owned()));
     }
 
+    /// Toggles the folding of a file and re-renders keeping the viewport
+    /// (GITILANTE_DIFF_FOLDING_SPEC.md sections 23-25).
+    fn toggle_file_fold(&self, key: folding::FileFoldKey) {
+        self.with_fold_state(|state| state.toggle_file(key));
+    }
+
+    fn toggle_hunk_fold(&self, key: folding::HunkFoldKey) {
+        self.with_fold_state(|state| state.toggle_hunk(key));
+    }
+
+    fn with_fold_state(&self, apply: impl FnOnce(&mut folding::DiffFoldState)) {
+        let document = {
+            let state = self.state.borrow();
+            state
+                .selection
+                .as_ref()
+                .and_then(folding::DiffDocumentKey::from_selection)
+        };
+        let Some(document) = document else {
+            return;
+        };
+        apply(self.folds.borrow_mut().for_document(&document));
+        self.rerender_diff();
+    }
+
+    /// Re-renders the current diff keeping the viewport
+    /// (GITILANTE_DIFF_FOLDING_SPEC.md section 25).
+    fn rerender_diff(&self) {
+        let adjustment = self.diff_scroll.vadjustment();
+        let anchor = adjustment.value();
+        self.render_diff();
+        gtk4::glib::idle_add_local_once(move || {
+            adjustment.set_value(anchor);
+        });
+    }
+
     /// Opens the read-only preview of a file (GITILANTE_SEARCH_SPEC.md §16).
     fn navigate_to_file(&self, path: &Path, line: Option<usize>, ranges: &[MatchRange]) {
         self.search_dialog.close();
@@ -964,7 +1004,7 @@ impl Inner {
                 None => diff_view::RenderedDiff::plain(diff_view::placeholder("Loading…")),
             },
             Some(Selection::Commit(oid)) => match &state.commit_diff {
-                Some((cached, diff)) if cached == oid => self.render_commit_diff(diff),
+                Some((cached, diff)) if cached == oid => self.render_commit_diff(oid, diff),
                 _ => diff_view::RenderedDiff::plain(diff_view::placeholder("Loading diff…")),
             },
             Some(Selection::FilePreview { path, line }) => match &state.file_preview {
@@ -996,7 +1036,23 @@ impl Inner {
         side: DiffSide,
     ) -> diff_view::RenderedDiff {
         match find_file(diff, path) {
-            Some(file) => diff_view::render(file, side, &self.highlighter, &self.diff_callbacks()),
+            Some(file) => {
+                // The fold state lives outside the Git model and survives
+                // refreshes best-effort (GITILANTE_DIFF_FOLDING_SPEC.md
+                // sections 11 and 14).
+                let mut store = self.folds.borrow_mut();
+                let empty = folding::DiffFoldState::default();
+                let folds: &folding::DiffFoldState =
+                    match folding::document_key_for_file(side, path) {
+                        Some(key) => {
+                            let state = store.for_document(&key);
+                            state.prune(diff);
+                            state
+                        }
+                        None => &empty,
+                    };
+                diff_view::render(file, side, &self.highlighter, folds, &self.diff_callbacks())
+            }
             None => diff_view::RenderedDiff::plain(diff_view::placeholder(
                 "No diff available for this file",
             )),
@@ -1057,12 +1113,16 @@ impl Inner {
     }
 
     /// Renders every file of a commit diff with the same renderer (SPEC §17).
-    fn render_commit_diff(&self, diff: &Diff) -> diff_view::RenderedDiff {
+    fn render_commit_diff(&self, oid: &str, diff: &Diff) -> diff_view::RenderedDiff {
         if diff.files.is_empty() {
             return diff_view::RenderedDiff::plain(diff_view::placeholder(
                 "No changes in this commit",
             ));
         }
+        let mut store = self.folds.borrow_mut();
+        let key = folding::DiffDocumentKey::Commit(oid.to_owned());
+        let folds = store.for_document(&key);
+        folds.prune(diff);
         let box_ = GtkBox::new(Orientation::Vertical, 24);
         let mut targets = Vec::new();
         for file in &diff.files {
@@ -1070,6 +1130,7 @@ impl Inner {
                 file,
                 DiffSide::History,
                 &self.highlighter,
+                folds,
                 &self.diff_callbacks(),
             );
             box_.append(&rendered.widget);
@@ -1098,6 +1159,22 @@ impl Inner {
             stage_file: op_callback(&weak, Inner::stage_file),
             unstage_file: op_callback(&weak, Inner::unstage_file),
             focus_hunk: op_callback(&weak, Inner::focus_hunk),
+            toggle_file: {
+                let weak = weak.clone();
+                Box::new(move |key| {
+                    if let Some(inner) = weak.upgrade() {
+                        inner.toggle_file_fold(key);
+                    }
+                })
+            },
+            toggle_hunk: {
+                let weak = weak.clone();
+                Box::new(move |key| {
+                    if let Some(inner) = weak.upgrade() {
+                        inner.toggle_hunk_fold(key);
+                    }
+                })
+            },
             discard_file: {
                 let weak = weak.clone();
                 Box::new(move |path: PathBuf| {

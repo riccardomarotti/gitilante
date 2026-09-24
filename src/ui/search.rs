@@ -402,11 +402,11 @@ pub fn reveal_iter(scrolled: &ScrolledWindow, target: &SearchTarget, iter: &gtk4
         return;
     };
     let location = target.view.iter_location(&iter);
-    if let Some((_, y)) = target.view.translate_coordinates(
-        &content,
-        f64::from(location.x()),
-        f64::from(location.y()),
-    ) {
+    if let Some(origin) = target
+        .view
+        .compute_point(&content, &gtk4::graphene::Point::new(0.0, 0.0))
+    {
+        let y = f64::from(origin.y() as i32 + location.y());
         let adjustment = scrolled.vadjustment();
         let top = y - adjustment.page_size() / 3.0;
         let maximum = (adjustment.upper() - adjustment.page_size()).max(adjustment.lower());

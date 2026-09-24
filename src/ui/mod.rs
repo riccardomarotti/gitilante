@@ -3,6 +3,7 @@
 pub mod app;
 pub mod changes;
 pub mod diff_view;
+pub mod folding;
 pub mod graph_gutter;
 pub mod history;
 pub mod main_window;

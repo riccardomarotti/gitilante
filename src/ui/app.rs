@@ -60,7 +60,7 @@ pub fn run(repo: Repository) -> i32 {
     // Ref badge styling for the History graph (BRANCH.md section 41).
     app.connect_startup(|_| {
         let provider = gtk4::CssProvider::new();
-        provider.load_from_data(BADGE_CSS);
+        provider.load_from_string(BADGE_CSS);
         if let Some(display) = gtk4::gdk::Display::default() {
             gtk4::style_context_add_provider_for_display(
                 &display,

@@ -18,7 +18,8 @@ use sourceview5::Language;
 
 use crate::syntax::Highlighter;
 
-use crate::model::diff::{DiffLineKind, FileDiff, Hunk};
+use crate::model::diff::{DiffLineKind, DiffStats, FileDiff, Hunk};
+use crate::ui::folding::{DiffFoldState, FileFoldKey, HunkFoldKey};
 use crate::ui::{DiffSide, HunkTarget, display_name};
 
 /// User actions available from the diff view.
@@ -41,6 +42,10 @@ pub struct Callbacks {
     /// Discard the working tree changes of the given path (the caller asks for
     /// confirmation first).
     pub discard_file: Box<dyn Fn(PathBuf)>,
+    /// Toggle the folding of a file (GITILANTE_DIFF_FOLDING_SPEC.md §23).
+    pub toggle_file: Box<dyn Fn(FileFoldKey)>,
+    /// Toggle the folding of a hunk.
+    pub toggle_hunk: Box<dyn Fn(HunkFoldKey)>,
 }
 
 /// One piece of searchable rendered text: the buffer of a hunk body holds
@@ -73,12 +78,25 @@ pub fn render(
     file: &FileDiff,
     side: DiffSide,
     highlighter: &Highlighter,
+    folds: &DiffFoldState,
     callbacks: &Rc<Callbacks>,
 ) -> RenderedDiff {
     let root = GtkBox::new(Orientation::Vertical, 12);
     let mut targets = Vec::new();
     set_margins(&root, 12);
-    root.append(&file_header(file, side, callbacks));
+
+    let file_key = FileFoldKey::from_file(file);
+    let collapsed = folds.is_file_collapsed(&file_key);
+    root.append(&file_header(file, side, collapsed, &file_key, callbacks));
+
+    // A collapsed file renders its header only (GITILANTE_DIFF_FOLDING_SPEC.md
+    // sections 3, 40 and 41).
+    if collapsed {
+        return RenderedDiff {
+            widget: root.upcast(),
+            targets,
+        };
+    }
 
     // One language per file: prefer the new path of a rename (COLORS.md §8).
     let language = file
@@ -99,10 +117,20 @@ pub fn render(
         }
     } else {
         for hunk in &file.hunks {
-            let (widget, target) =
-                hunk_view(file, hunk, side, language.as_ref(), highlighter, callbacks);
+            let hunk_key = HunkFoldKey::from_hunk(file, hunk);
+            let (widget, target) = hunk_view(
+                file,
+                hunk,
+                side,
+                language.as_ref(),
+                highlighter,
+                folds.is_hunk_collapsed(&hunk_key),
+                callbacks,
+            );
             root.append(&widget);
-            targets.push(target);
+            if let Some(target) = target {
+                targets.push(target);
+            }
         }
     }
     RenderedDiff {
@@ -252,8 +280,56 @@ pub fn placeholder(text: &str) -> gtk4::Widget {
 }
 
 /// Header row of a file: name and whole-file actions.
-fn file_header(file: &FileDiff, side: DiffSide, callbacks: &Rc<Callbacks>) -> gtk4::Widget {
+/// The ▼/▶ disclosure control of a collapsible section. The button carries the
+/// expanded state for assistive technologies and works from the keyboard
+/// (GITILANTE_DIFF_FOLDING_SPEC.md sections 6, 38 and 39).
+fn disclosure_button(collapsed: bool, what: &str, on_toggle: impl Fn() + 'static) -> gtk4::Button {
+    let button = gtk4::Button::from_icon_name(if collapsed {
+        "pan-end-symbolic"
+    } else {
+        "pan-down-symbolic"
+    });
+    button.set_has_frame(false);
+    button.set_tooltip_text(Some(&format!(
+        "{} this {what}",
+        if collapsed { "Expand" } else { "Collapse" }
+    )));
+    button.update_state(&[gtk4::accessible::State::Expanded(Some(!collapsed))]);
+    button.connect_clicked(move |_| on_toggle());
+    button
+}
+
+/// Makes the header text a click target for the folding toggle
+/// (GITILANTE_DIFF_FOLDING_SPEC.md section 7). A drag still selects the text.
+fn attach_toggle_gesture(label: &Label, on_toggle: impl Fn() + 'static) {
+    let gesture = gtk4::GestureClick::new();
+    gesture.connect_released(move |_, _, _, _| on_toggle());
+    label.add_controller(gesture);
+}
+
+/// The `+N −M` summary of a file or hunk
+/// (GITILANTE_DIFF_FOLDING_SPEC.md sections 8-9).
+fn stats_label(stats: DiffStats) -> Label {
+    let label = Label::new(Some(&format!("+{} −{}", stats.additions, stats.deletions)));
+    label.add_css_class("dim-label");
+    label.add_css_class("monospace");
+    label
+}
+
+fn file_header(
+    file: &FileDiff,
+    side: DiffSide,
+    collapsed: bool,
+    key: &FileFoldKey,
+    callbacks: &Rc<Callbacks>,
+) -> gtk4::Widget {
     let header = GtkBox::new(Orientation::Horizontal, 8);
+
+    header.append(&disclosure_button(collapsed, "file", {
+        let callbacks = callbacks.clone();
+        let key = key.clone();
+        move || (callbacks.toggle_file)(key.clone())
+    }));
 
     let name = Label::new(Some(&display_name(
         file.path().unwrap_or_else(|| std::path::Path::new("")),
@@ -265,7 +341,14 @@ fn file_header(file: &FileDiff, side: DiffSide, callbacks: &Rc<Callbacks>) -> gt
     name.set_xalign(0.0);
     name.set_ellipsize(pango::EllipsizeMode::Middle);
     name.set_hexpand(true);
+    attach_toggle_gesture(&name, {
+        let callbacks = callbacks.clone();
+        let key = key.clone();
+        move || (callbacks.toggle_file)(key.clone())
+    });
     header.append(&name);
+
+    header.append(&stats_label(file.stats()));
 
     match side {
         DiffSide::Staged => {
@@ -301,8 +384,9 @@ fn hunk_view(
     side: DiffSide,
     language: Option<&Language>,
     highlighter: &Highlighter,
+    collapsed: bool,
     callbacks: &Rc<Callbacks>,
-) -> (gtk4::Widget, SearchTarget) {
+) -> (gtk4::Widget, Option<SearchTarget>) {
     let block = GtkBox::new(Orientation::Vertical, 4);
     let target = HunkTarget {
         file: file.clone(),
@@ -311,6 +395,13 @@ fn hunk_view(
     };
 
     let header = GtkBox::new(Orientation::Horizontal, 8);
+    let key = HunkFoldKey::from_hunk(file, hunk);
+    header.append(&disclosure_button(collapsed, "hunk", {
+        let callbacks = callbacks.clone();
+        let key = key.clone();
+        move || (callbacks.toggle_hunk)(key.clone())
+    }));
+
     let header_label = Label::new(Some(&hunk.header_text()));
     header_label.add_css_class("monospace");
     header_label.add_css_class("heading");
@@ -318,8 +409,15 @@ fn hunk_view(
     header_label.set_ellipsize(pango::EllipsizeMode::End);
     header_label.set_hexpand(true);
     header_label.set_selectable(true);
+    attach_toggle_gesture(&header_label, {
+        let callbacks = callbacks.clone();
+        let key = key.clone();
+        move || (callbacks.toggle_hunk)(key.clone())
+    });
     track_focus(&header_label, &target, callbacks);
     header.append(&header_label);
+
+    header.append(&stats_label(hunk.stats()));
 
     match side {
         DiffSide::Staged => {
@@ -385,10 +483,16 @@ fn hunk_view(
     }
     block.append(&header);
 
+    // Collapsed hunks render the header only: the line widgets are never
+    // created (GITILANTE_DIFF_FOLDING_SPEC.md sections 3, 40 and 41).
+    if collapsed {
+        return (block.upcast(), None);
+    }
+
     let (body, search_target) = hunk_body(hunk, language, highlighter);
     track_focus(&body, &target, callbacks);
     block.append(&body);
-    (block.upcast(), search_target)
+    (block.upcast(), Some(search_target))
 }
 
 /// Appends an action button that reports its hunk when focused or clicked.
