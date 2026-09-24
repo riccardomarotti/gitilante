@@ -8,6 +8,7 @@
 //! - reports errors with toasts, reserving dialogs for decisions (discard).
 
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::rc::{Rc, Weak};
 
@@ -21,6 +22,7 @@ use crate::git::Error;
 use crate::git::repository::Repository;
 use crate::model::commit::Commit;
 use crate::model::diff::{Diff, FileDiff, Hunk};
+use crate::model::refs::{CommitRef, HeadRef};
 use crate::model::status::{Status, StatusEntry};
 use crate::ui::worker::Worker;
 use crate::ui::{DiffSide, HunkTarget, Selection, changes, diff_view, history, short_path};
@@ -30,6 +32,14 @@ const HISTORY_PAGE: usize = 200;
 
 /// Distance from the sidebar bottom that triggers loading more history.
 const HISTORY_SCROLL_THRESHOLD: f64 = 300.0;
+
+/// Everything read from Git in one history block: the commits of the page plus
+/// the refs and HEAD needed by the badges (BRANCH.md sections 4-11).
+type HistoryData = (
+    Vec<Commit>,
+    HashMap<String, Vec<CommitRef>>,
+    Option<HeadRef>,
+);
 
 /// Everything read from Git in one refresh.
 struct RefreshData {
@@ -47,6 +57,10 @@ struct State {
     generation: u64,
     /// Commits loaded so far.
     commits: Vec<Commit>,
+    /// Refs pointing at the loaded commits (BRANCH.md sections 9-10).
+    refs: HashMap<String, Vec<CommitRef>>,
+    /// Checked out HEAD (BRANCH.md section 11).
+    head: Option<HeadRef>,
     /// True while a history request is in flight (requests are single flight).
     history_loading: bool,
     /// True when Git returned fewer commits than requested.
@@ -240,12 +254,14 @@ impl Inner {
         }
 
         // Re-render the diff when the light/dark appearance changes, so the
-        // syntax style scheme follows the theme (COLORS.md sections 17, 32).
+        // syntax style scheme follows the theme (COLORS.md sections 17, 32)
+        // and the graph palette stays readable (BRANCH.md section 65).
         {
             let weak = self_weak.clone();
             adw::StyleManager::default().connect_dark_notify(move |_| {
                 if let Some(inner) = weak.upgrade() {
                     inner.render_diff();
+                    inner.render_history();
                 }
             });
         }
@@ -345,7 +361,14 @@ impl Inner {
         let repo = self.repo.clone();
         let weak = self.self_weak.clone();
         self.worker.run(
-            move || repo.history(skip, count),
+            move || -> Result<HistoryData, Error> {
+                // Refs and HEAD are read with the page so the badges follow
+                // the normal refresh cycle (BRANCH.md section 50).
+                let commits = repo.history(skip, count)?;
+                let refs = repo.commit_refs()?;
+                let head = repo.head()?;
+                Ok((commits, refs, head))
+            },
             move |result| {
                 if let Some(inner) = weak.upgrade() {
                     inner.finish_history(append, count, result);
@@ -354,13 +377,15 @@ impl Inner {
         );
     }
 
-    fn finish_history(&self, append: bool, requested: usize, result: Result<Vec<Commit>, Error>) {
+    fn finish_history(&self, append: bool, requested: usize, result: Result<HistoryData, Error>) {
         self.busy_finish();
         match result {
-            Ok(commits) => {
+            Ok((commits, refs, head)) => {
                 let mut state = self.state.borrow_mut();
                 state.history_loading = false;
                 state.history_exhausted = commits.len() < requested;
+                state.refs = refs;
+                state.head = head;
                 if append {
                     state.commits.extend(commits);
                 } else {
@@ -489,17 +514,31 @@ impl Inner {
 
     /// Rebuilds the History sidebar.
     fn render_history(&self) {
-        let (commits, selection, loading, exhausted) = {
+        let (commits, refs, head, selection, loading, exhausted) = {
             let state = self.state.borrow();
             (
                 state.commits.clone(),
+                state.refs.clone(),
+                state.head.clone(),
                 state.selection.clone(),
                 state.history_loading,
                 state.history_exhausted,
             )
         };
-        self.history_view
-            .update(&commits, selection.as_ref(), loading, exhausted);
+        // The layout is pure and cheap: computed here, never while drawing
+        // (BRANCH.md section 53).
+        let graph = crate::graph::layout_commits(&commits);
+        let dark = adw::StyleManager::default().is_dark();
+        self.history_view.update(
+            &commits,
+            &graph,
+            &refs,
+            head.as_ref(),
+            dark,
+            selection.as_ref(),
+            loading,
+            exhausted,
+        );
     }
 
     /// Rebuilds the diff pane for the current selection.

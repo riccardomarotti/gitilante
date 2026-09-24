@@ -4,6 +4,7 @@
 //! short object name, the subject, the author and a relative date.
 
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::rc::Rc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -11,8 +12,10 @@ use gtk4::pango;
 use gtk4::prelude::*;
 use gtk4::{Box as GtkBox, Button, Label, ListBox, ListBoxRow, Orientation, SelectionMode};
 
+use crate::graph::{GraphRow, HistoryGraph};
 use crate::model::commit::Commit;
-use crate::ui::Selection;
+use crate::model::refs::{CommitRef, HeadRef, RefKind};
+use crate::ui::{Selection, graph_gutter};
 
 /// User actions available from the History list.
 pub struct Callbacks {
@@ -99,11 +102,18 @@ impl HistoryView {
 
     /// Rebuilds the list from the commits loaded so far.
     ///
-    /// `loading` and `exhausted` control the trailing row that offers the next
-    /// block of commits.
+    /// `graph` is the layout computed over `commits` (BRANCH.md section 53);
+    /// `refs` and `head` drive the badges (BRANCH.md sections 39-42) and `dark`
+    /// selects the lane palette. `loading` and `exhausted` control the trailing
+    /// row that offers the next block of commits.
+    #[allow(clippy::too_many_arguments)]
     pub fn update(
         &self,
         commits: &[Commit],
+        graph: &HistoryGraph,
+        refs: &HashMap<String, Vec<CommitRef>>,
+        head: Option<&HeadRef>,
+        dark: bool,
         selection: Option<&Selection>,
         loading: bool,
         exhausted: bool,
@@ -115,8 +125,8 @@ impl HistoryView {
         let mut items = self.shared.items.borrow_mut();
         items.clear();
 
-        for commit in commits {
-            self.push_commit(commit);
+        for (commit, row_graph) in commits.iter().zip(&graph.rows) {
+            self.push_commit(commit, row_graph, graph.max_lanes, refs, head, dark);
             items.push(Some(Selection::Commit(commit.oid.clone())));
         }
 
@@ -140,16 +150,30 @@ impl HistoryView {
         self.shared.rebuilding.set(false);
     }
 
-    /// Appends one commit row.
-    fn push_commit(&self, commit: &Commit) {
+    /// Appends one commit row: graph gutter plus commit information.
+    fn push_commit(
+        &self,
+        commit: &Commit,
+        row_graph: &GraphRow,
+        max_lanes: usize,
+        refs: &HashMap<String, Vec<CommitRef>>,
+        head: Option<&HeadRef>,
+        dark: bool,
+    ) {
         let row = ListBoxRow::new();
         row.set_activatable(true);
+
+        // The gutter has no margins: it must cover the whole row height so the
+        // lanes never break between rows (BRANCH.md section 35).
+        let outer = GtkBox::new(Orientation::Horizontal, 0);
+        outer.append(&graph_gutter::new(row_graph, max_lanes, dark));
 
         let box_ = GtkBox::new(Orientation::Vertical, 2);
         box_.set_margin_top(6);
         box_.set_margin_bottom(6);
-        box_.set_margin_start(6);
+        box_.set_margin_start(2);
         box_.set_margin_end(6);
+        box_.set_hexpand(true);
 
         let title = GtkBox::new(Orientation::Horizontal, 8);
         let oid = Label::new(Some(commit.short_oid()));
@@ -161,6 +185,7 @@ impl HistoryView {
         subject.set_hexpand(true);
         subject.set_ellipsize(pango::EllipsizeMode::End);
         title.append(&subject);
+        push_badges(&title, commit, refs, head);
         box_.append(&title);
 
         let detail = Label::new(Some(&format!(
@@ -174,7 +199,8 @@ impl HistoryView {
         detail.set_ellipsize(pango::EllipsizeMode::End);
         box_.append(&detail);
 
-        row.set_child(Some(&box_));
+        outer.append(&box_);
+        row.set_child(Some(&outer));
         self.list.append(&row);
     }
 
@@ -204,6 +230,41 @@ impl HistoryView {
 
         row.set_child(Some(&box_));
         self.list.append(&row);
+    }
+}
+
+/// Appends the ref badges of a commit to its title row
+/// (BRANCH.md sections 39-42).
+fn push_badges(
+    title: &GtkBox,
+    commit: &Commit,
+    refs: &HashMap<String, Vec<CommitRef>>,
+    head: Option<&HeadRef>,
+) {
+    let none = Vec::new();
+    for commit_ref in refs.get(&commit.oid).unwrap_or(&none) {
+        let label = Label::new(Some(&commit_ref.name));
+        label.add_css_class("ref-badge");
+        label.add_css_class(match commit_ref.kind {
+            RefKind::LocalBranch => "ref-local",
+            RefKind::RemoteBranch => "ref-remote",
+        });
+        // The checked out branch stands out (BRANCH.md section 42).
+        if commit_ref.kind == RefKind::LocalBranch
+            && head.and_then(|head| head.branch.as_deref()) == Some(commit_ref.name.as_str())
+        {
+            label.add_css_class("ref-current");
+        }
+        title.append(&label);
+    }
+    // A detached HEAD is shown explicitly on its commit (BRANCH.md section 11).
+    if let Some(head) = head {
+        if head.branch.is_none() && head.oid == commit.oid {
+            let label = Label::new(Some("HEAD"));
+            label.add_css_class("ref-badge");
+            label.add_css_class("ref-head");
+            title.append(&label);
+        }
     }
 }
 
