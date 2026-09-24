@@ -26,6 +26,14 @@ pub enum Selection {
     Commit(String),
     /// A conflicted (unmerged) file, shown read-only.
     Conflicted(PathBuf),
+    /// A read-only file preview opened by the search
+    /// (GITILANTE_SEARCH_SPEC.md sections 16 and 41).
+    FilePreview {
+        /// Path relative to the repository root.
+        path: PathBuf,
+        /// 1-based line to reveal, when known.
+        line: Option<usize>,
+    },
 }
 
 /// A hunk that has keyboard focus, with its file and side.

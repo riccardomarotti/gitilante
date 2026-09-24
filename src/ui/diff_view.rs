@@ -136,6 +136,112 @@ pub fn render_untracked(path: &std::path::Path, callbacks: &Rc<Callbacks>) -> Re
     RenderedDiff::plain(root.upcast())
 }
 
+/// Renders the read-only file preview for the search results
+/// (GITILANTE_SEARCH_SPEC.md sections 16 and 42).
+///
+/// The preview shows the working tree content with line numbers and syntax
+/// highlighting and nothing else: no diff backgrounds, no intraline spans and
+/// no hunk actions.
+pub fn render_file_preview(
+    path: &std::path::Path,
+    content: &str,
+    highlighter: &Highlighter,
+) -> RenderedDiff {
+    /// Large files are truncated: a preview is never a full editor.
+    const MAX_PREVIEW_LINES: usize = 5000;
+
+    let root = GtkBox::new(Orientation::Vertical, 12);
+    set_margins(&root, 12);
+
+    let header = GtkBox::new(Orientation::Horizontal, 8);
+    let name = Label::new(Some(&display_name(path, None)));
+    name.add_css_class("heading");
+    name.set_xalign(0.0);
+    name.set_ellipsize(pango::EllipsizeMode::Middle);
+    name.set_hexpand(true);
+    header.append(&name);
+    let hint = Label::new(Some("working tree · read-only"));
+    hint.add_css_class("dim-label");
+    hint.add_css_class("caption");
+    header.append(&hint);
+    root.append(&header);
+
+    let lines: Vec<String> = content
+        .lines()
+        .take(MAX_PREVIEW_LINES)
+        .map(str::to_owned)
+        .collect();
+    let truncated = content.lines().count() > MAX_PREVIEW_LINES;
+
+    // One coherent source stream per file (COLORS.md section 11).
+    let language = crate::syntax::detect_language(path);
+    let scheme = crate::syntax::style_scheme();
+    let styles = highlighter.highlight(language.as_ref(), scheme.as_ref(), &lines);
+
+    let buffer = TextBuffer::new(Some(highlighter.table()));
+    let mut text = String::new();
+    for line in &lines {
+        text.push_str(line);
+        text.push('\n');
+    }
+    buffer.insert(&mut buffer.start_iter(), &text);
+    for (row, segments) in styles.iter().enumerate() {
+        for segment in segments {
+            apply_range(
+                &buffer,
+                row as i32,
+                segment.start,
+                segment.end,
+                &segment.tags,
+            );
+        }
+    }
+
+    // Line numbers live in the gutter, never in the source text
+    // (COLORS.md sections 5 and 19).
+    let width = lines.len().to_string().len();
+    let mut gutter = String::new();
+    for number in 1..=lines.len() {
+        gutter.push_str(&format!("{number:>width$} │\n"));
+    }
+    let gutter_view = Label::new(Some(&gutter));
+    gutter_view.add_css_class("monospace");
+    gutter_view.add_css_class("dim-label");
+    gutter_view.set_xalign(1.0);
+    gutter_view.set_margin_start(8);
+    gutter_view.set_margin_top(4);
+    gutter_view.set_margin_bottom(4);
+
+    let body = TextView::with_buffer(&buffer);
+    body.set_editable(false);
+    body.set_cursor_visible(false);
+    body.set_monospace(true);
+    body.set_wrap_mode(WrapMode::None);
+    body.set_left_margin(4);
+    body.set_right_margin(8);
+    body.set_top_margin(4);
+    body.set_bottom_margin(4);
+    body.set_hexpand(true);
+
+    let box_ = GtkBox::new(Orientation::Horizontal, 0);
+    box_.add_css_class("frame");
+    box_.append(&gutter_view);
+    box_.append(&body);
+    root.append(&box_);
+
+    if truncated {
+        root.append(&placeholder(&format!(
+            "Preview truncated to the first {MAX_PREVIEW_LINES} lines"
+        )));
+    }
+
+    let target = SearchTarget { buffer, view: body };
+    RenderedDiff {
+        widget: root.upcast(),
+        targets: vec![target],
+    }
+}
+
 /// Renders a centered-left informational label.
 pub fn placeholder(text: &str) -> gtk4::Widget {
     let label = Label::new(Some(text));

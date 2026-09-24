@@ -73,16 +73,19 @@ impl SearchDialog {
         entry.set_placeholder_text(Some("Search repository…"));
         content.append(&entry);
 
-        // Scope row (section 2). Files, Contents and History arrive with their
+        // Scope row (section 2). Contents and History arrive with their
         // providers (GITILANTE_SEARCH_SPEC.md sections 79).
         let scopes = GtkBox::new(Orientation::Horizontal, 0);
         scopes.add_css_class("linked");
         let scope_all = ToggleButton::with_label("All");
         let scope_changes = ToggleButton::with_label("Changes");
+        let scope_files = ToggleButton::with_label("Files");
         scope_changes.set_group(Some(&scope_all));
+        scope_files.set_group(Some(&scope_all));
         scope_all.set_active(true);
         scopes.append(&scope_all);
         scopes.append(&scope_changes);
+        scopes.append(&scope_files);
         content.append(&scopes);
 
         // Added/Removed filter, shown only for the Changes scope (section 10).
@@ -166,6 +169,16 @@ impl SearchDialog {
             scope_changes.connect_toggled(move |button| {
                 if button.is_active() {
                     shared.query.borrow_mut().scope = SearchScope::Changes;
+                    update_filter_visibility(&shared);
+                    run_search(&shared);
+                }
+            });
+        }
+        {
+            let shared = shared.clone();
+            scope_files.connect_toggled(move |button| {
+                if button.is_active() {
+                    shared.query.borrow_mut().scope = SearchScope::Files;
                     update_filter_visibility(&shared);
                     run_search(&shared);
                 }

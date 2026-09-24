@@ -11,7 +11,9 @@ pub fn is_case_sensitive(query: &str) -> bool {
     query.chars().any(char::is_uppercase)
 }
 
-fn chars_match(needle: char, haystack: char, case_sensitive: bool) -> bool {
+/// Compares two characters under the requested case mode (shared by the
+/// providers, GITILANTE_SEARCH_SPEC.md section 8).
+pub fn chars_match(needle: char, haystack: char, case_sensitive: bool) -> bool {
     if case_sensitive {
         needle == haystack
     } else {

@@ -25,6 +25,7 @@ use crate::model::diff::{Diff, FileDiff, Hunk};
 use crate::model::refs::{CommitRef, HeadRef};
 use crate::model::status::{Status, StatusEntry};
 use crate::search::SearchQuery;
+use crate::search::SearchScope;
 use crate::search::result::{ChangeSearchResult, SearchResult};
 use crate::ui::worker::Worker;
 use crate::ui::{
@@ -71,6 +72,9 @@ struct State {
     history_exhausted: bool,
     /// Diff of the selected commit, loaded lazily (SPEC section 22).
     commit_diff: Option<(String, Diff)>,
+    /// Content of the selected file preview, loaded lazily
+    /// (GITILANTE_SEARCH_SPEC.md section 16).
+    file_preview: Option<(PathBuf, Result<Vec<u8>, String>)>,
     /// Bumped on every selection change; stale commit diffs are dropped.
     commit_diff_generation: u64,
     /// Hunk that has keyboard focus, target of the contextual shortcuts.
@@ -573,6 +577,10 @@ impl Inner {
                 .commit_diff
                 .as_ref()
                 .is_some_and(|(cached, _)| cached == oid),
+            Selection::FilePreview { path, .. } => state
+                .file_preview
+                .as_ref()
+                .is_some_and(|(cached, _)| cached == path),
             _ => true,
         };
         state.selection = Some(selection.clone());
@@ -580,10 +588,50 @@ impl Inner {
 
         self.render_diff();
         if !cached {
-            if let Selection::Commit(oid) = selection {
-                self.load_commit_diff(generation, oid);
+            match selection {
+                Selection::Commit(oid) => self.load_commit_diff(generation, oid),
+                Selection::FilePreview { path, .. } => self.load_file_preview(generation, path),
+                _ => {}
             }
         }
+    }
+
+    /// Loads the working tree content of a file preview
+    /// (GITILANTE_SEARCH_SPEC.md section 16).
+    fn load_file_preview(&self, generation: u64, path: PathBuf) {
+        self.busy_start();
+        let root = self.repo.root().to_path_buf();
+        let weak = self.self_weak.clone();
+        self.worker.run(
+            move || {
+                std::fs::read(root.join(&path))
+                    .map(|bytes| (path.clone(), bytes))
+                    .map_err(|error| (path, error.to_string()))
+            },
+            move |result| {
+                if let Some(inner) = weak.upgrade() {
+                    inner.finish_file_preview(generation, result);
+                }
+            },
+        );
+    }
+
+    fn finish_file_preview(
+        &self,
+        generation: u64,
+        result: Result<(PathBuf, Vec<u8>), (PathBuf, String)>,
+    ) {
+        self.busy_finish();
+        let mut state = self.state.borrow_mut();
+        if state.commit_diff_generation != generation {
+            return; // stale result (SPEC section 21)
+        }
+        state.file_preview = Some(match result {
+            Ok((path, bytes)) => (path, Ok(bytes)),
+            Err((path, error)) => (path, Err(error)),
+        });
+        drop(state);
+        self.render_diff();
     }
 
     /// Runs the global search on the worker thread
@@ -598,12 +646,22 @@ impl Inner {
                 None => (Diff::default(), Diff::default()),
             }
         };
+        let repo = self.repo.clone();
         let weak = self.self_weak.clone();
         self.worker.run(
             move || {
-                // Phase 2-3: the Changes provider works on the diffs already
-                // loaded, it never re-runs git diff (section 53).
-                crate::search::changes::search(&query, &worktree, &staged)
+                // The providers work on data already loaded or on the worker
+                // thread (GITILANTE_SEARCH_SPEC.md sections 52-53).
+                let mut results = Vec::new();
+                if matches!(query.scope, SearchScope::All | SearchScope::Changes) {
+                    results.extend(crate::search::changes::search(&query, &worktree, &staged));
+                }
+                if matches!(query.scope, SearchScope::All | SearchScope::Files) {
+                    if let Ok(files) = repo.files() {
+                        results.extend(crate::search::files::search(&query, &files));
+                    }
+                }
+                results
             },
             move |results| {
                 if let Some(inner) = weak.upgrade() {
@@ -618,10 +676,21 @@ impl Inner {
 
     /// Navigates to an activated search result (GITILANTE_SEARCH_SPEC.md §12).
     fn activate_search_result(&self, result: SearchResult) {
-        // The other providers arrive with their phases.
-        if let SearchResult::Change(change) = result {
-            self.navigate_to_change(&change);
+        match result {
+            SearchResult::Change(change) => self.navigate_to_change(&change),
+            SearchResult::File(file) => self.navigate_to_file(&file.path, None),
+            // The other providers arrive with their phases.
+            _ => {}
         }
+    }
+
+    /// Opens the read-only preview of a file (GITILANTE_SEARCH_SPEC.md §16).
+    fn navigate_to_file(&self, path: &Path, line: Option<usize>) {
+        self.search_dialog.close();
+        self.select(Selection::FilePreview {
+            path: path.to_path_buf(),
+            line,
+        });
     }
 
     fn navigate_to_change(&self, result: &ChangeSearchResult) {
@@ -754,6 +823,15 @@ impl Inner {
                 Some((cached, diff)) if cached == oid => self.render_commit_diff(diff),
                 _ => diff_view::RenderedDiff::plain(diff_view::placeholder("Loading diff…")),
             },
+            Some(Selection::FilePreview { path, line }) => match &state.file_preview {
+                Some((cached, content)) if cached == path => match content {
+                    Ok(bytes) => self.render_file_preview(path, bytes, *line),
+                    Err(_) => diff_view::RenderedDiff::plain(diff_view::placeholder(
+                        "Cannot read this file",
+                    )),
+                },
+                _ => diff_view::RenderedDiff::plain(diff_view::placeholder("Loading…")),
+            },
         };
         self.diff_box.append(&rendered.widget);
         // Ctrl+F searches the freshly rendered text (GITILANTE_SEARCH_SPEC.md §3);
@@ -775,6 +853,33 @@ impl Inner {
                 "No diff available for this file",
             )),
         }
+    }
+
+    /// Renders the read-only file preview (GITILANTE_SEARCH_SPEC.md §16).
+    fn render_file_preview(
+        &self,
+        path: &Path,
+        bytes: &[u8],
+        line: Option<usize>,
+    ) -> diff_view::RenderedDiff {
+        // Binary files have no textual preview.
+        if bytes.iter().take(8192).any(|byte| *byte == 0) {
+            return diff_view::RenderedDiff::plain(diff_view::placeholder("Binary file"));
+        }
+        let content = String::from_utf8_lossy(bytes);
+        let rendered = diff_view::render_file_preview(path, &content, &self.highlighter);
+        // Reveal the requested line (GITILANTE_SEARCH_SPEC.md section 22).
+        if let Some(line) = line {
+            if let Some(target) = rendered.targets.first() {
+                if let Some(iter) = target
+                    .buffer
+                    .iter_at_line_offset((line.saturating_sub(1)) as i32, 0)
+                {
+                    search::reveal_iter(&self.diff_scroll, target, &iter);
+                }
+            }
+        }
+        rendered
     }
 
     /// Renders every file of a commit diff with the same renderer (SPEC §17).
@@ -1048,6 +1153,7 @@ fn selection_exists(status: &Status, selection: &Selection) -> bool {
         Selection::Conflicted(path) => status.unmerged_entries().any(|entry| entry.path == *path),
         // Commits are immutable: a selected commit stays valid across refreshes.
         Selection::Commit(_) => true,
+        Selection::FilePreview { .. } => true,
     }
 }
 
