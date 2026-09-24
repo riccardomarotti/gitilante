@@ -52,7 +52,10 @@ pub fn run(repo: Repository) -> i32 {
 
     app.set_accels_for_action("win.refresh", &["<Primary>r"]);
     app.set_accels_for_action("win.search", &["<Primary>f"]);
-    app.set_accels_for_action("win.global-search", &["<Primary><Shift>f"]);
+    app.set_accels_for_action(
+        "win.global-search",
+        &["<Primary><Shift>f", "<Primary><Shift>F"],
+    );
 
     // Ref badge styling for the History graph (BRANCH.md section 41).
     app.connect_startup(|_| {

@@ -134,6 +134,21 @@ impl SearchDialog {
                 schedule_search(&shared);
             });
         }
+        {
+            // Enter is consumed by the entry: open the selected result
+            // (GITILANTE_SEARCH_SPEC.md section 51).
+            let shared = shared.clone();
+            entry.connect_activate(move |_| activate_selected(&shared));
+        }
+        {
+            // Esc is consumed by the entry too: it emits stop-search.
+            let dialog_weak = dialog.downgrade();
+            entry.connect_stop_search(move |_| {
+                if let Some(dialog) = dialog_weak.upgrade() {
+                    <adw::Dialog as AdwDialogExt>::close(&dialog);
+                }
+            });
+        }
 
         // Scope and filter changes run immediately.
         {

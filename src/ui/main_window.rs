@@ -300,9 +300,7 @@ impl Inner {
             let weak = self_weak.clone();
             global_search_action.connect_activate(move |_, _| {
                 if let Some(inner) = weak.upgrade() {
-                    if !inner.search_dialog.is_open() {
-                        inner.search_dialog.present(&inner.window);
-                    }
+                    inner.search_dialog.present(&inner.window);
                 }
             });
         }
