@@ -25,10 +25,30 @@ use crate::search::{CaseMode, ChangeFilter, SearchQuery, SearchScope};
 /// Delay between the last keystroke and the search (section 33).
 const SEARCH_DEBOUNCE: Duration = Duration::from_millis(200);
 
+/// A generation belongs to the user's search intent, not the worker start.
+#[derive(Default)]
+pub(crate) struct SearchGeneration(Cell<u64>);
+
+impl SearchGeneration {
+    pub fn invalidate(&self) {
+        self.0.set(self.0.get().wrapping_add(1));
+    }
+
+    pub fn current(&self) -> u64 {
+        self.0.get()
+    }
+
+    pub fn accepts(&self, generation: u64) -> bool {
+        self.current() == generation
+    }
+}
+
 /// User actions available from the dialog.
 pub struct Callbacks {
     /// Run the query (on the worker thread, section 52).
     pub search: Box<dyn Fn(SearchQuery)>,
+    /// Invalidates in-flight results as soon as the search intent changes.
+    pub invalidate: Box<dyn Fn()>,
     /// A result was activated with its query (navigation, sections 12 and 30).
     pub activate: Box<dyn Fn(SearchResult, SearchQuery)>,
     /// Told when the dialog opens/closes, to suspend the single-key shortcuts
@@ -153,7 +173,7 @@ impl SearchDialog {
             let shared = shared.clone();
             entry.connect_search_changed(move |entry| {
                 shared.query.borrow_mut().text = entry.text().to_string();
-                schedule_search(&shared);
+                search_changed(&shared, true);
             });
         }
         {
@@ -177,7 +197,7 @@ impl SearchDialog {
             let shared = shared.clone();
             regex_toggle.connect_toggled(move |button| {
                 shared.query.borrow_mut().regex = button.is_active();
-                run_search(&shared);
+                search_changed(&shared, false);
             });
         }
         {
@@ -197,7 +217,7 @@ impl SearchDialog {
                     CaseMode::Sensitive => "Match case — click to change",
                     CaseMode::Insensitive => "Ignore case — click to change",
                 }));
-                run_search(&shared);
+                search_changed(&shared, false);
             });
         }
         {
@@ -206,7 +226,7 @@ impl SearchDialog {
                 if button.is_active() {
                     shared.query.borrow_mut().scope = SearchScope::All;
                     update_filter_visibility(&shared);
-                    run_search(&shared);
+                    search_changed(&shared, false);
                 }
             });
         }
@@ -216,7 +236,7 @@ impl SearchDialog {
                 if button.is_active() {
                     shared.query.borrow_mut().scope = SearchScope::Changes;
                     update_filter_visibility(&shared);
-                    run_search(&shared);
+                    search_changed(&shared, false);
                 }
             });
         }
@@ -226,7 +246,7 @@ impl SearchDialog {
                 if button.is_active() {
                     shared.query.borrow_mut().scope = SearchScope::Files;
                     update_filter_visibility(&shared);
-                    run_search(&shared);
+                    search_changed(&shared, false);
                 }
             });
         }
@@ -236,7 +256,7 @@ impl SearchDialog {
                 if button.is_active() {
                     shared.query.borrow_mut().scope = SearchScope::Contents;
                     update_filter_visibility(&shared);
-                    run_search(&shared);
+                    search_changed(&shared, false);
                 }
             });
         }
@@ -246,7 +266,7 @@ impl SearchDialog {
                 if button.is_active() {
                     shared.query.borrow_mut().scope = SearchScope::History;
                     update_filter_visibility(&shared);
-                    run_search(&shared);
+                    search_changed(&shared, false);
                 }
             });
         }
@@ -258,7 +278,7 @@ impl SearchDialog {
                 if button.is_active() {
                     shared.query.borrow_mut().scope = SearchScope::HistoryChanges;
                     update_filter_visibility(&shared);
-                    run_search(&shared);
+                    search_changed(&shared, false);
                 }
             });
         }
@@ -271,7 +291,7 @@ impl SearchDialog {
             button.connect_toggled(move |button| {
                 if button.is_active() {
                     shared.query.borrow_mut().change_filter = filter;
-                    run_search(&shared);
+                    search_changed(&shared, false);
                 }
             });
         }
@@ -321,6 +341,7 @@ impl SearchDialog {
             // (GITILANTE_SEARCH_SPEC.md section 51).
             let shared = shared.clone();
             dialog.connect_closed(move |_| {
+                cancel_search(&shared);
                 (shared.callbacks.on_open)(false);
             });
         }
@@ -331,7 +352,9 @@ impl SearchDialog {
     /// Shows the dialog over `parent`.
     pub fn present(&self, parent: &impl IsA<gtk4::Widget>) {
         (self.shared.callbacks.on_open)(true);
+        cancel_search(&self.shared);
         <adw::Dialog as AdwDialogExt>::present(&self.dialog, Some(parent));
+        run_search(&self.shared);
         self.shared.entry.grab_focus();
         self.shared.entry.select_region(0, -1);
     }
@@ -344,6 +367,18 @@ impl SearchDialog {
     /// True while the dialog is visible.
     pub fn is_open(&self) -> bool {
         self.dialog.is_visible()
+    }
+
+    /// Invalidates results before a repository refresh.
+    pub fn repository_changed(&self) {
+        cancel_search(&self.shared);
+    }
+
+    /// Reruns the query after fresh repository data arrives.
+    pub fn rerun_if_open(&self) {
+        if self.is_open() {
+            run_search(&self.shared);
+        }
     }
 
     /// Replaces the result list (GITILANTE_SEARCH_SPEC.md sections 31-32).
@@ -384,11 +419,7 @@ impl SearchDialog {
 
     /// Clears the results and the status.
     pub fn reset(&self) {
-        while let Some(row) = self.shared.list.row_at_index(0) {
-            self.shared.list.remove(&row);
-        }
-        self.shared.rows.borrow_mut().clear();
-        self.shared.status.set_text("");
+        clear_results(&self.shared);
     }
 }
 
@@ -438,10 +469,33 @@ fn update_filter_visibility(shared: &Rc<Shared>) {
     shared.filter_box.set_visible(visible);
 }
 
-/// Debounces the search (GITILANTE_SEARCH_SPEC.md section 33).
-fn schedule_search(shared: &Rc<Shared>) {
-    let token = shared.debounce.get() + 1;
-    shared.debounce.set(token);
+/// Invalidates workers and debounce immediately, then clears stale rows.
+fn cancel_search(shared: &Rc<Shared>) {
+    shared.debounce.set(shared.debounce.get().wrapping_add(1));
+    (shared.callbacks.invalidate)();
+    clear_results(shared);
+}
+
+fn clear_results(shared: &Shared) {
+    while let Some(row) = shared.list.row_at_index(0) {
+        shared.list.remove(&row);
+    }
+    shared.rows.borrow_mut().clear();
+    shared.status.set_text("");
+}
+
+/// Starts a new intent now; only worker execution is debounced.
+fn search_changed(shared: &Rc<Shared>, debounce: bool) {
+    cancel_search(shared);
+    if shared.query.borrow().is_empty() {
+        return;
+    }
+    shared.status.set_text("Searching…");
+    if !debounce {
+        run_search(shared);
+        return;
+    }
+    let token = shared.debounce.get();
     let shared = shared.clone();
     gtk4::glib::timeout_add_local_once(SEARCH_DEBOUNCE, move || {
         if shared.debounce.get() == token {
@@ -454,7 +508,7 @@ fn schedule_search(shared: &Rc<Shared>) {
 fn run_search(shared: &Rc<Shared>) {
     let query = shared.query.borrow().clone();
     if query.is_empty() {
-        shared.status.set_text("");
+        clear_results(shared);
         return;
     }
     shared.status.set_text("Searching…");
@@ -635,4 +689,37 @@ fn marked_snippet(snippet: &str, ranges: &[MatchRange]) -> String {
 /// The short object name of a commit.
 fn short_oid(oid: &str) -> &str {
     &oid[..oid.len().min(7)]
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::SearchGeneration;
+
+    #[test]
+    fn older_worker_is_stale_before_new_debounce_expires() {
+        let intent = SearchGeneration::default();
+        let worker_a = intent.current();
+        intent.invalidate(); // Text/scope/options changed; B has not started yet.
+        assert!(!intent.accepts(worker_a));
+        let worker_b = intent.current();
+        assert!(intent.accepts(worker_b));
+    }
+
+    #[test]
+    fn clearing_query_or_entering_invalid_regex_rejects_old_results() {
+        let intent = SearchGeneration::default();
+        let worker = intent.current();
+        intent.invalidate(); // Empty query, or invalid regex before validation.
+        assert!(!intent.accepts(worker));
+    }
+
+    #[test]
+    fn close_and_reopen_reject_previous_session() {
+        let intent = SearchGeneration::default();
+        let worker = intent.current();
+        intent.invalidate(); // Close.
+        intent.invalidate(); // Reopen and rerun.
+        assert!(!intent.accepts(worker));
+        assert!(intent.accepts(intent.current()));
+    }
 }

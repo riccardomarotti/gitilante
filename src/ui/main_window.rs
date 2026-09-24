@@ -126,8 +126,8 @@ struct Inner {
     search_bar: search::SearchBar,
     /// Ctrl+Shift+F global search dialog (GITILANTE_SEARCH_SPEC.md §5).
     search_dialog: Rc<search_dialog::SearchDialog>,
-    /// Bumped on every search: stale results are dropped (section 35).
-    search_generation: Cell<u64>,
+    /// Bumped on every search intent: stale results are dropped.
+    search_generation: search_dialog::SearchGeneration,
     diff_box: GtkBox,
     diff_scroll: ScrolledWindow,
     /// Sidebar scroll, anchored across History rebuilds.
@@ -271,6 +271,14 @@ impl Inner {
                         inner.run_search(query);
                     }
                 }),
+                invalidate: {
+                    let weak = self_weak.clone();
+                    Box::new(move || {
+                        if let Some(inner) = weak.upgrade() {
+                            inner.search_generation.invalidate();
+                        }
+                    })
+                },
                 activate: {
                     let weak = self_weak.clone();
                     Box::new(move |result, query| {
@@ -446,7 +454,7 @@ impl Inner {
             history_view,
             search_bar,
             search_dialog,
-            search_generation: Cell::new(0),
+            search_generation: search_dialog::SearchGeneration::default(),
             diff_box,
             diff_scroll,
             sidebar_adjustment: sidebar_scroll.vadjustment(),
@@ -474,6 +482,7 @@ impl Inner {
 
     /// Reloads status, diffs and history from Git (SPEC section 20).
     fn refresh(&self) {
+        self.search_dialog.repository_changed();
         let generation = {
             let mut state = self.state.borrow_mut();
             state.generation += 1;
@@ -617,6 +626,7 @@ impl Inner {
         }
         self.render_changes();
         self.render_diff();
+        self.search_dialog.rerun_if_open();
         // Open the solver when a selected conflict has no session yet (§58).
         let pending_conflict = {
             let state = self.state.borrow();
@@ -1090,8 +1100,10 @@ impl Inner {
     /// Runs the global search on the worker thread
     /// (GITILANTE_SEARCH_SPEC.md sections 52-53).
     fn run_search(&self, query: SearchQuery) {
+        let generation = self.search_generation.current();
         // An invalid pattern reports before any provider runs (section 38).
         if let Err(message) = crate::search::matcher::validate(&query) {
+            self.search_dialog.reset();
             self.search_dialog.show_error(&message);
             return;
         }
@@ -1102,8 +1114,6 @@ impl Inner {
                 query.scope, query.text, query.regex
             );
         }
-        let generation = self.search_generation.get() + 1;
-        self.search_generation.set(generation);
         let (worktree, staged) = {
             let state = self.state.borrow();
             match state.data.as_ref() {
@@ -1147,7 +1157,7 @@ impl Inner {
             move |(results, error)| {
                 if let Some(inner) = weak.upgrade() {
                     // A stale search never overwrites newer ones (section 35).
-                    if inner.search_generation.get() == generation {
+                    if inner.search_generation.accepts(generation) {
                         inner.search_dialog.show_results(results);
                         if let Some(message) = error {
                             // A failing provider never hides the others
