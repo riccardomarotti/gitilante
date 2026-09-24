@@ -7,7 +7,7 @@ mod common;
 use common::TestRepo;
 use gitilante::conflict::{
     BuildError, CommitIdentity, ConflictContext, ConflictFilePart, ConflictOperation,
-    ConflictResolution, parse,
+    ConflictPresentation, ConflictResolution, ConflictSide, parse,
 };
 use gitilante::git::Repository as Backend;
 use gitilante::git::conflict::conflict_context;
@@ -279,4 +279,207 @@ fn unknown_operation_uses_neutral_labels() {
     assert_eq!(context.description(), None);
     assert_eq!(context.use_a_action(), "Use version A");
     assert_eq!(context.use_b_action(), "Use version B");
+}
+
+/// Builds a repository where both branches add the same path with different
+/// content: a text add/add conflict (§47, §84).
+fn add_add_conflict(file_name: &str, ours: &[u8], theirs: &[u8]) -> TestRepo {
+    let repo = TestRepo::new();
+    repo.write("base.txt", b"base\n");
+    repo.commit_all("initial");
+    repo.git(&["checkout", "-b", "feature"]);
+    repo.write(file_name, theirs);
+    repo.commit_all("feature adds");
+    repo.git(&["checkout", "main"]);
+    repo.write(file_name, ours);
+    repo.commit_all("main adds");
+    let (merged, ..) = repo.try_git(&["merge", "feature"]);
+    assert!(!merged);
+    repo
+}
+
+/// §84 — a text add/add conflict opens as blocks and resolves into the file.
+#[test]
+fn add_add_text_conflict_resolves() {
+    let repo = add_add_conflict("added.txt", b"our content\n", b"their content\n");
+    let backend = Backend::discover(Path::new(repo.root())).unwrap();
+    let path = Path::new("added.txt");
+
+    let load = backend.conflict(path).unwrap().unwrap();
+    let ConflictPresentation::TextBlocks(file) = &load.presentation else {
+        panic!("expected text blocks, got {:?}", load.presentation);
+    };
+    assert_eq!(file.conflict_count(), 1);
+
+    let resolved = file.build_resolved(&[ConflictResolution::SourceB]).unwrap();
+    backend.apply_conflict_resolution(path, &resolved).unwrap();
+    assert_eq!(backend.status().unwrap().unmerged_entries().count(), 0);
+    assert_eq!(
+        std::fs::read(repo.root().join("added.txt")).unwrap(),
+        b"their content\n"
+    );
+}
+
+/// §85 — binary add/add is a whole-file choice with no text decoding.
+#[test]
+fn binary_add_add_conflict_uses_whole_file_choice() {
+    let repo = add_add_conflict(
+        "logo.bin",
+        b"\x00\x01our binary\n",
+        b"\x00\x02their binary\n",
+    );
+    let backend = Backend::discover(Path::new(repo.root())).unwrap();
+    let path = Path::new("logo.bin");
+
+    let load = backend.conflict(path).unwrap().unwrap();
+    let ConflictPresentation::WholeFileChoice {
+        version_a,
+        version_b,
+    } = &load.presentation
+    else {
+        panic!("expected whole-file choice, got {:?}", load.presentation);
+    };
+    assert!(version_a.binary && version_b.binary);
+    assert_eq!(version_a.bytes, b"\x00\x01our binary\n");
+    assert_eq!(version_b.bytes, b"\x00\x02their binary\n");
+
+    backend
+        .apply_conflict_resolution(path, &version_a.bytes)
+        .unwrap();
+    assert_eq!(backend.status().unwrap().unmerged_entries().count(), 0);
+    assert_eq!(
+        std::fs::read(repo.root().join("logo.bin")).unwrap(),
+        b"\x00\x01our binary\n"
+    );
+}
+
+/// §83 — modify/delete offers keep/delete and can resolve either way.
+#[test]
+fn modify_delete_conflict_can_keep_or_delete() {
+    // Deleted by them: our modified version survives.
+    let repo = TestRepo::new();
+    repo.write("victim.txt", b"original\n");
+    repo.commit_all("initial");
+    repo.git(&["checkout", "-b", "feature"]);
+    repo.remove("victim.txt");
+    repo.commit_all("feature deletes");
+    repo.git(&["checkout", "main"]);
+    repo.write("victim.txt", b"original\nmodified by main\n");
+    repo.commit_all("main modifies");
+    let (merged, ..) = repo.try_git(&["merge", "feature"]);
+    assert!(!merged);
+
+    let backend = Backend::discover(Path::new(repo.root())).unwrap();
+    let path = Path::new("victim.txt");
+    let load = backend.conflict(path).unwrap().unwrap();
+    let ConflictPresentation::KeepOrDelete {
+        content,
+        content_side,
+    } = &load.presentation
+    else {
+        panic!("expected keep-or-delete, got {:?}", load.presentation);
+    };
+    assert_eq!(*content_side, ConflictSide::SourceA);
+    assert_eq!(content, b"original\nmodified by main\n");
+
+    backend.mark_deleted(path).unwrap();
+    assert_eq!(backend.status().unwrap().unmerged_entries().count(), 0);
+    assert!(!repo.root().join("victim.txt").exists());
+}
+
+/// §83 — deleted by us: the other side's version can be kept as staged.
+#[test]
+fn deleted_by_us_conflict_can_keep_file() {
+    let repo = TestRepo::new();
+    repo.write("victim.txt", b"original\n");
+    repo.commit_all("initial");
+    repo.git(&["checkout", "-b", "feature"]);
+    repo.write("victim.txt", b"original\nmodified by feature\n");
+    repo.commit_all("feature modifies");
+    repo.git(&["checkout", "main"]);
+    repo.remove("victim.txt");
+    repo.commit_all("main deletes");
+    let (merged, ..) = repo.try_git(&["merge", "feature"]);
+    assert!(!merged);
+
+    let backend = Backend::discover(Path::new(repo.root())).unwrap();
+    let path = Path::new("victim.txt");
+    let load = backend.conflict(path).unwrap().unwrap();
+    let ConflictPresentation::KeepOrDelete { content_side, .. } = &load.presentation else {
+        panic!("expected keep-or-delete, got {:?}", load.presentation);
+    };
+    assert_eq!(*content_side, ConflictSide::SourceB);
+
+    backend.mark_resolved(path).unwrap();
+    assert_eq!(backend.status().unwrap().unmerged_entries().count(), 0);
+    assert!(repo.root().join("victim.txt").exists());
+}
+
+/// §82 — markers removed by hand only need staging, content stays untouched.
+#[test]
+fn manually_resolved_file_is_only_staged() {
+    let repo = add_add_conflict("added.txt", b"our content\n", b"their content\n");
+    let backend = Backend::discover(Path::new(repo.root())).unwrap();
+    let path = Path::new("added.txt");
+    repo.write("added.txt", b"fixed by hand\n");
+
+    let load = backend.conflict(path).unwrap().unwrap();
+    assert_eq!(
+        load.presentation,
+        ConflictPresentation::AlreadyManuallyResolved
+    );
+
+    backend.mark_resolved(path).unwrap();
+    assert_eq!(backend.status().unwrap().unmerged_entries().count(), 0);
+    assert_eq!(
+        std::fs::read(repo.root().join("added.txt")).unwrap(),
+        b"fixed by hand\n"
+    );
+}
+
+/// §81 — external edits invalidate the solver's snapshot.
+#[test]
+fn external_edit_invalidates_the_snapshot() {
+    let repo = add_add_conflict("added.txt", b"our content\n", b"their content\n");
+    let backend = Backend::discover(Path::new(repo.root())).unwrap();
+    let path = Path::new("added.txt");
+    let load = backend.conflict(path).unwrap().unwrap();
+    assert!(
+        backend
+            .conflict_file_unchanged(path, load.working_tree.as_deref())
+            .unwrap()
+    );
+
+    repo.write("added.txt", b"changed outside\n");
+    assert!(
+        !backend
+            .conflict_file_unchanged(path, load.working_tree.as_deref())
+            .unwrap()
+    );
+}
+
+/// §86 — paths with spaces and a leading dash work through `--`.
+#[test]
+fn conflicted_paths_with_spaces_and_dashes_work() {
+    let repo = add_add_conflict("wei rd -name.txt", b"ours\n", b"theirs\n");
+    let backend = Backend::discover(Path::new(repo.root())).unwrap();
+    let path = Path::new("wei rd -name.txt");
+
+    let load = backend.conflict(path).unwrap().unwrap();
+    let ConflictPresentation::TextBlocks(file) = &load.presentation else {
+        panic!("expected text blocks, got {:?}", load.presentation);
+    };
+    let resolved = file.build_resolved(&[ConflictResolution::SourceA]).unwrap();
+    backend.apply_conflict_resolution(path, &resolved).unwrap();
+    assert_eq!(backend.status().unwrap().unmerged_entries().count(), 0);
+}
+
+/// §56 — a non-unmerged path reports no conflict.
+#[test]
+fn clean_path_reports_no_conflict() {
+    let repo = TestRepo::new();
+    repo.write("file.txt", b"content\n");
+    repo.commit_all("initial");
+    let backend = Backend::discover(Path::new(repo.root())).unwrap();
+    assert_eq!(backend.conflict(Path::new("file.txt")).unwrap(), None);
 }

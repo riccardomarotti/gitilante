@@ -4,9 +4,13 @@
 //! never deduced from conflict marker text (spec §4).
 
 use crate::conflict::context::{CommitIdentity, ConflictContext, ConflictOperation};
+use crate::conflict::presentation::{ConflictPresentation, classify};
 use crate::git::error::Error;
 use crate::git::repository::Repository;
-use crate::git::{Result, command};
+use crate::git::{Result, command, status};
+use crate::model::status::UnmergedInfo;
+use std::ffi::OsStr;
+use std::path::Path;
 
 /// Detects the operation in progress and builds the conflict context.
 pub fn conflict_context(repo: &Repository) -> Result<ConflictContext> {
@@ -93,4 +97,130 @@ fn identity_for(repo: &Repository, oid: &str) -> Result<CommitIdentity> {
             .map(str::to_owned)
             .collect(),
     })
+}
+
+/// Everything the conflict solver needs for one conflicted path (§58).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConflictLoad {
+    /// Operation context with the resolved labels.
+    pub context: ConflictContext,
+    /// Unmerged stage metadata from the status record.
+    pub unmerged: UnmergedInfo,
+    /// Working tree snapshot taken while opening the solver (§16, §39).
+    pub working_tree: Option<Vec<u8>>,
+    /// Stage 2 blob content, when the stage exists.
+    pub stage_a: Option<Vec<u8>>,
+    /// Stage 3 blob content, when the stage exists.
+    pub stage_b: Option<Vec<u8>>,
+    /// How the conflict must be presented (§55).
+    pub presentation: ConflictPresentation,
+}
+
+/// Loads the conflict state of one path, or `None` when it is not unmerged.
+///
+/// The working tree file is the primary source of the in-progress result:
+/// manual edits made outside Gitilante are preserved exactly (§16).
+pub fn load(repo: &Repository, path: &Path) -> Result<Option<ConflictLoad>> {
+    let repository_status = status::status(repo)?;
+    let Some(entry) = repository_status
+        .entries
+        .iter()
+        .find(|entry| entry.path == path)
+    else {
+        return Ok(None);
+    };
+    let Some(unmerged) = entry.unmerged().cloned() else {
+        return Ok(None);
+    };
+
+    let working_tree = read_working_tree(repo, path)?;
+    let stage_a = read_stage(repo, &unmerged.stage2)?;
+    let stage_b = read_stage(repo, &unmerged.stage3)?;
+    let presentation = classify(
+        &unmerged,
+        working_tree.as_deref(),
+        stage_a.as_deref(),
+        stage_b.as_deref(),
+    );
+    Ok(Some(ConflictLoad {
+        context: conflict_context(repo)?,
+        unmerged,
+        working_tree,
+        stage_a,
+        stage_b,
+        presentation,
+    }))
+}
+
+/// Reads the working tree file; a missing file is `None` (§48-50).
+fn read_working_tree(repo: &Repository, path: &Path) -> Result<Option<Vec<u8>>> {
+    let full_path = repo.root().join(path);
+    match std::fs::read(&full_path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(source) => Err(Error::Io {
+            command: format!("read working tree file {path:?}"),
+            source,
+        }),
+    }
+}
+
+/// Reads one stage blob through its OID (§15).
+fn read_stage(
+    repo: &Repository,
+    stage: &crate::model::status::ConflictStage,
+) -> Result<Option<Vec<u8>>> {
+    match &stage.oid {
+        Some(oid) => Ok(Some(
+            command::run(
+                repo.root(),
+                &[OsStr::new("cat-file"), OsStr::new("blob"), oid.as_ref()],
+            )?
+            .stdout,
+        )),
+        None => Ok(None),
+    }
+}
+
+/// Verifies the working tree file still matches the solver's snapshot (§39).
+///
+/// The caller must refuse to apply a resolution when this returns `false`:
+/// external edits are never overwritten silently (§40).
+pub fn unchanged_since(repo: &Repository, path: &Path, snapshot: Option<&[u8]>) -> Result<bool> {
+    Ok(read_working_tree(repo, path)?.as_deref() == snapshot)
+}
+
+/// Writes the resolution to the working tree and stages it (§43).
+///
+/// Writing and staging are not atomic: when staging fails the file keeps the
+/// resolution on disk and the error is surfaced unchanged (§44).
+pub fn apply_resolution(repo: &Repository, path: &Path, content: &[u8]) -> Result<()> {
+    let full_path = repo.root().join(path);
+    std::fs::write(&full_path, content).map_err(|source| Error::Io {
+        command: format!("write working tree file {path:?}"),
+        source,
+    })?;
+    mark_resolved(repo, path)
+}
+
+/// Stages the current working tree content as the resolution (§41).
+///
+/// The file content is not modified.
+pub fn mark_resolved(repo: &Repository, path: &Path) -> Result<()> {
+    let args = [OsStr::new("add"), OsStr::new("--"), path.as_os_str()];
+    command::run(repo.root(), &args)?;
+    Ok(())
+}
+
+/// Resolves a file-level conflict by deleting the file (§45).
+pub fn mark_deleted(repo: &Repository, path: &Path) -> Result<()> {
+    let args = [
+        OsStr::new("rm"),
+        OsStr::new("-f"),
+        OsStr::new("-q"),
+        OsStr::new("--"),
+        path.as_os_str(),
+    ];
+    command::run(repo.root(), &args)?;
+    Ok(())
 }

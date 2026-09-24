@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 
 use crate::git::Result;
 use crate::git::command;
+use crate::git::conflict::{self, ConflictLoad};
 use crate::git::error::Error;
 use crate::git::patch::{self, ApplyTarget};
 use crate::model::commit::Commit;
@@ -201,6 +202,33 @@ impl Repository {
     /// the UI must ask for an explicit confirmation before calling it.
     pub fn discard_file(&self, entry: &StatusEntry) -> Result<()> {
         self.run_on_paths(&["restore", "--worktree"], entry, false)
+    }
+
+    /// Loads the conflict state of one path for the conflict solver (§58).
+    ///
+    /// Returns `None` when the path is not unmerged right now.
+    pub fn conflict(&self, path: &Path) -> Result<Option<ConflictLoad>> {
+        conflict::load(self, path)
+    }
+
+    /// Verifies the file still matches the solver's snapshot (§39).
+    pub fn conflict_file_unchanged(&self, path: &Path, snapshot: Option<&[u8]>) -> Result<bool> {
+        conflict::unchanged_since(self, path, snapshot)
+    }
+
+    /// Writes a conflict resolution and stages it (§43).
+    pub fn apply_conflict_resolution(&self, path: &Path, content: &[u8]) -> Result<()> {
+        conflict::apply_resolution(self, path, content)
+    }
+
+    /// Stages the current content as the resolution without editing it (§41).
+    pub fn mark_resolved(&self, path: &Path) -> Result<()> {
+        conflict::mark_resolved(self, path)
+    }
+
+    /// Resolves a file-level conflict by deleting the file (§45).
+    pub fn mark_deleted(&self, path: &Path) -> Result<()> {
+        conflict::mark_deleted(self, path)
     }
 
     /// Runs a command on the entry's path, adding the original path of a

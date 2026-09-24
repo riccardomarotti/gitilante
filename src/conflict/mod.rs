@@ -7,9 +7,11 @@
 pub mod context;
 pub mod markers;
 pub mod model;
+pub mod presentation;
 pub mod resolution;
 
 pub use context::{CommitIdentity, ConflictContext, ConflictOperation, ConflictSource};
 pub use markers::{MarkerParseError, parse};
 pub use model::{ConflictBlock, ConflictFile, ConflictFilePart};
+pub use presentation::{ConflictPresentation, ConflictSide, FileVersion, classify};
 pub use resolution::{BuildError, ConflictResolution};
