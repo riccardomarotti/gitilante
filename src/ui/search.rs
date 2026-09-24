@@ -141,15 +141,18 @@ impl SearchBar {
             });
         }
         {
+            // Enter is consumed by the entry: the canonical activate signal
+            // moves to the next match (GITILANTE_SEARCH_SPEC.md section 51).
+            let shared = shared.clone();
+            entry.connect_activate(move |_| next_match(&shared));
+        }
+        {
             let shared = shared.clone();
             let controller = gtk4::EventControllerKey::new();
             controller.connect_key_pressed(move |_, keyval, _, state| match keyval {
-                Key::Return | Key::KP_Enter => {
-                    if state.contains(gdk::ModifierType::SHIFT_MASK) {
-                        previous_match(&shared);
-                    } else {
-                        next_match(&shared);
-                    }
+                // Shift+Enter is not handled by the entry (previous match).
+                Key::Return | Key::KP_Enter if state.contains(gdk::ModifierType::SHIFT_MASK) => {
+                    previous_match(&shared);
                     gtk4::glib::Propagation::Stop
                 }
                 Key::Escape => {
