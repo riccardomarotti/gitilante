@@ -28,7 +28,11 @@ branch, merge, ...).
   theme;
 - line colors for added/removed lines with an extra overlay on the parts that
   actually changed inside a line (intraline diff);
-- commit diffs render every file with the same viewer.
+- commit diffs render every file with the same viewer;
+- collapsible files and hunks with `+N −M` summaries: fold what you are not
+  reviewing, with `Collapse/Expand all` actions from the header menu; the
+  fold state survives refreshes and selection switches, and searches
+  automatically expand what they need to show.
 
 ### History
 
