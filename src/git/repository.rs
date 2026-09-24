@@ -1,5 +1,6 @@
 //! Repository discovery and high-level operations.
 
+use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
 use std::os::unix::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
@@ -10,6 +11,7 @@ use crate::git::error::Error;
 use crate::git::patch::{self, ApplyTarget};
 use crate::model::commit::Commit;
 use crate::model::diff::{Diff, FileDiff, Hunk};
+use crate::model::refs::{CommitRef, HeadRef};
 use crate::model::status::{Status, StatusEntry};
 
 /// Adds the purely derived visual metadata (intraline spans) to a freshly
@@ -86,9 +88,23 @@ impl Repository {
         enrich(crate::git::diff::staged_diff(self))
     }
 
-    /// Loads up to `max_count` commits of HEAD starting at `skip` (SPEC §16).
+    /// Loads up to `max_count` commits starting at `skip`, in topological
+    /// order, covering HEAD and every local and remote branch
+    /// (BRANCH.md sections 4-6).
     pub fn history(&self, skip: usize, max_count: usize) -> Result<Vec<Commit>> {
         crate::git::history::history(self, skip, max_count)
+    }
+
+    /// Maps the commit of every local and remote branch to its refs
+    /// (BRANCH.md sections 9-12).
+    pub fn commit_refs(&self) -> Result<HashMap<String, Vec<CommitRef>>> {
+        crate::git::refs::commit_refs(self)
+    }
+
+    /// The checked out HEAD, or `None` on an unborn branch
+    /// (BRANCH.md section 11).
+    pub fn head(&self) -> Result<Option<HeadRef>> {
+        crate::git::refs::head(self)
     }
 
     /// Diff of a single commit (SPEC §17).

@@ -2,4 +2,5 @@
 
 pub mod commit;
 pub mod diff;
+pub mod refs;
 pub mod status;

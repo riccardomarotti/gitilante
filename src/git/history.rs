@@ -19,26 +19,39 @@ const LOG_FORMAT: &str = "%H%x00%P%x00%an%x00%ae%x00%at%x00%s";
 /// Result of the output parsers, failing with a human-readable detail.
 type ParseResult<T> = std::result::Result<T, String>;
 
-/// Loads up to `max_count` commits of HEAD starting at `skip`.
+/// Loads up to `max_count` commits starting at `skip`, in topological order.
 ///
-/// A repository without commits has no history and yields an empty list.
+/// The history covers HEAD and every local and remote branch (BRANCH.md
+/// sections 4-6): unmerged branches appear in the commit graph too and every
+/// commit is listed before its parents. A repository without commits or refs
+/// has no history and yields an empty list (BRANCH.md section 7).
 pub fn history(repo: &Repository, skip: usize, max_count: usize) -> Result<Vec<Commit>> {
-    if !head_exists(repo)? {
+    let include_head = head_exists(repo)?;
+    if !include_head && crate::git::refs::commit_refs(repo)?.is_empty() {
         return Ok(Vec::new());
     }
 
-    let args = [
+    let mut args: Vec<String> = vec![
         "-c".to_owned(),
         "core.quotePath=true".to_owned(),
         "log".to_owned(),
+        // Topological order: every commit before its parents (BRANCH.md section 6).
+        "--topo-order".to_owned(),
         // Machine readable output must not depend on user configuration.
         "--no-decorate".to_owned(),
         "--no-show-signature".to_owned(),
         format!("--format={LOG_FORMAT}"),
         format!("--skip={skip}"),
         format!("--max-count={max_count}"),
-        "HEAD".to_owned(),
     ];
+    if include_head {
+        // A detached HEAD commit must be listed even when unreferenced
+        // (BRANCH.md section 8).
+        args.push("HEAD".to_owned());
+    }
+    // Branch tips not reachable from HEAD must appear too (BRANCH.md section 4).
+    args.push("--branches".to_owned());
+    args.push("--remotes".to_owned());
 
     let output = command::run(repo.root(), &args)?;
     parse(&output.stdout).map_err(|detail| Error::MalformedOutput {
