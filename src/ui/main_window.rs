@@ -22,6 +22,7 @@ use crate::conflict::presentation::ConflictPresentation;
 use crate::conflict::resolution::ConflictResolution;
 use crate::git::Error;
 use crate::git::conflict::{ApplyAction, ApplyOutcome, ConflictLoad};
+use crate::git::history::FileHistoryEntry;
 use crate::git::repository::Repository;
 use crate::model::commit::Commit;
 use crate::model::diff::{Diff, FileDiff, Hunk};
@@ -48,6 +49,7 @@ const HISTORY_SCROLL_THRESHOLD: f64 = 300.0;
 /// the refs and HEAD needed by the badges (BRANCH.md sections 4-11).
 type HistoryData = (
     Vec<Commit>,
+    Vec<FileHistoryEntry>,
     HashMap<String, Vec<CommitRef>>,
     Option<HeadRef>,
 );
@@ -59,6 +61,17 @@ struct RefreshData {
     staged: Diff,
 }
 
+/// History sidebar mode; file history follows the lineage from HEAD.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+enum HistoryMode {
+    #[default]
+    Repository,
+    File {
+        display_path: PathBuf,
+        seed_path: PathBuf,
+    },
+}
+
 /// Current UI state.
 #[derive(Default)]
 struct State {
@@ -68,6 +81,9 @@ struct State {
     generation: u64,
     /// Commits loaded so far.
     commits: Vec<Commit>,
+    file_entries: Vec<FileHistoryEntry>,
+    history_mode: HistoryMode,
+    history_generation: u64,
     /// Refs pointing at the loaded commits (BRANCH.md sections 9-10).
     refs: HashMap<String, Vec<CommitRef>>,
     /// Checked out HEAD (BRANCH.md section 11).
@@ -95,6 +111,22 @@ struct State {
     conflict_sessions: HashMap<PathBuf, Rc<RefCell<conflict_view::ConflictSession>>>,
     /// Load failures of the conflict solver, keyed by path.
     conflict_errors: HashMap<PathBuf, String>,
+}
+
+impl State {
+    /// Switching modes invalidates every in-flight history page immediately.
+    fn change_history_mode(&mut self, mode: HistoryMode) -> bool {
+        if self.history_mode == mode {
+            return false;
+        }
+        self.history_mode = mode;
+        self.history_generation = self.history_generation.wrapping_add(1);
+        self.history_loading = false;
+        self.history_exhausted = false;
+        self.commits.clear();
+        self.file_entries.clear();
+        true
+    }
 }
 
 struct Inner {
@@ -212,6 +244,14 @@ impl Inner {
                     if let Some(inner) = weak.upgrade() {
                         inner.changes.clear_selection();
                         inner.select(selection);
+                    }
+                })
+            },
+            all_history: {
+                let weak = self_weak.clone();
+                Box::new(move || {
+                    if let Some(inner) = weak.upgrade() {
+                        inner.set_history_mode(HistoryMode::Repository);
                     }
                 })
             },
@@ -510,6 +550,11 @@ impl Inner {
 
     /// Reloads the history blocks loaded so far.
     fn request_history_replace(&self) {
+        {
+            let mut state = self.state.borrow_mut();
+            state.history_generation = state.history_generation.wrapping_add(1);
+            state.history_loading = false;
+        }
         let count = {
             let state = self.state.borrow();
             state.commits.len().max(HISTORY_PAGE)
@@ -518,6 +563,23 @@ impl Inner {
     }
 
     /// Loads the next block of history (SPEC sections 16 and 22).
+    fn set_history_mode(&self, mode: HistoryMode) {
+        if !self.state.borrow_mut().change_history_mode(mode) {
+            return;
+        }
+        self.request_history_replace();
+        self.render_diff();
+        let history = self.history_view.widget().clone();
+        let adjustment = self.sidebar_adjustment.clone();
+        gtk4::glib::idle_add_local_once(move || {
+            if let Some(parent) = history.parent() {
+                if let Some(bounds) = history.compute_bounds(&parent) {
+                    adjustment.set_value(f64::from(bounds.y()));
+                }
+            }
+        });
+    }
+
     fn request_history_more(&self) {
         let skip = self.state.borrow().commits.len();
         self.request_history(true, skip, HISTORY_PAGE);
@@ -526,13 +588,14 @@ impl Inner {
     /// Single-flight history request: `append` adds to the loaded commits,
     /// otherwise the list is replaced.
     fn request_history(&self, append: bool, skip: usize, count: usize) {
-        {
+        let (generation, mode) = {
             let mut state = self.state.borrow_mut();
             if state.history_loading || (append && state.history_exhausted) {
                 return;
             }
             state.history_loading = true;
-        }
+            (state.history_generation, state.history_mode.clone())
+        };
         self.busy_start();
         self.render_history();
 
@@ -540,25 +603,39 @@ impl Inner {
         let weak = self.self_weak.clone();
         self.worker.run(
             move || -> Result<HistoryData, Error> {
-                // Refs and HEAD are read with the page so the badges follow
-                // the normal refresh cycle (BRANCH.md section 50).
-                let commits = repo.history(skip, count)?;
+                let (commits, entries) = match &mode {
+                    HistoryMode::Repository => (repo.history(skip, count)?, Vec::new()),
+                    HistoryMode::File { seed_path, .. } => {
+                        let entries = repo.file_history(seed_path, skip, count)?;
+                        let commits = entries.iter().map(|entry| entry.commit.clone()).collect();
+                        (commits, entries)
+                    }
+                };
                 let refs = repo.commit_refs()?;
                 let head = repo.head()?;
-                Ok((commits, refs, head))
+                Ok((commits, entries, refs, head))
             },
             move |result| {
                 if let Some(inner) = weak.upgrade() {
-                    inner.finish_history(append, count, result);
+                    inner.finish_history(generation, append, count, result);
                 }
             },
         );
     }
 
-    fn finish_history(&self, append: bool, requested: usize, result: Result<HistoryData, Error>) {
+    fn finish_history(
+        &self,
+        generation: u64,
+        append: bool,
+        requested: usize,
+        result: Result<HistoryData, Error>,
+    ) {
         self.busy_finish();
+        if self.state.borrow().history_generation != generation {
+            return;
+        }
         match result {
-            Ok((commits, refs, head)) => {
+            Ok((commits, entries, refs, head)) => {
                 let mut state = self.state.borrow_mut();
                 state.history_loading = false;
                 state.history_exhausted = commits.len() < requested;
@@ -566,8 +643,10 @@ impl Inner {
                 state.head = head;
                 if append {
                     state.commits.extend(commits);
+                    state.file_entries.extend(entries);
                 } else {
                     state.commits = commits;
+                    state.file_entries = entries;
                 }
             }
             Err(error) => {
@@ -576,6 +655,14 @@ impl Inner {
             }
         }
         self.render_history();
+        let update_file_diff = {
+            let state = self.state.borrow();
+            matches!(state.history_mode, HistoryMode::File { .. })
+                && matches!(state.selection, Some(Selection::Commit(_)))
+        };
+        if update_file_diff {
+            self.render_diff();
+        }
     }
 
     /// Applies a refresh result unless a newer refresh superseded it.
@@ -1538,7 +1625,7 @@ impl Inner {
 
     /// Rebuilds the History sidebar.
     fn render_history(&self) {
-        let (commits, refs, head, selection, loading, exhausted) = {
+        let (commits, refs, head, selection, loading, exhausted, mode) = {
             let state = self.state.borrow();
             (
                 state.commits.clone(),
@@ -1547,6 +1634,7 @@ impl Inner {
                 state.selection.clone(),
                 state.history_loading,
                 state.history_exhausted,
+                state.history_mode.clone(),
             )
         };
         // The layout is pure and cheap: computed here, never while drawing
@@ -1566,6 +1654,10 @@ impl Inner {
             selection.as_ref(),
             loading,
             exhausted,
+            match &mode {
+                HistoryMode::Repository => None,
+                HistoryMode::File { display_path, .. } => Some(display_path.as_path()),
+            },
         );
         gtk4::glib::idle_add_local_once(move || {
             adjustment.set_value(anchor);
@@ -1623,13 +1715,29 @@ impl Inner {
             },
             Some(Selection::Commit(oid)) => match &state.commit_diff {
                 Some((cached, diff)) if cached == oid => {
-                    self.render_commit_diff(oid, diff, focus.as_ref())
+                    let paths = match &state.history_mode {
+                        HistoryMode::Repository => None,
+                        HistoryMode::File { .. } => state
+                            .file_entries
+                            .iter()
+                            .find(|entry| entry.commit.oid == *oid)
+                            .map(|entry| entry.paths.as_slice()),
+                    };
+                    self.render_commit_diff(oid, diff, focus.as_ref(), paths)
                 }
                 _ => diff_view::RenderedDiff::plain(diff_view::placeholder("Loading diff…")),
             },
             Some(Selection::FilePreview { path, line }) => match &state.file_preview {
                 Some((cached, content)) if cached == path => match content {
-                    Ok(bytes) => self.render_file_preview(path, bytes, *line, flash.take()),
+                    Ok(bytes) => {
+                        let tracked = state.data.as_ref().is_some_and(|data| {
+                            !data
+                                .status
+                                .untracked_entries()
+                                .any(|entry| path.starts_with(&entry.path))
+                        });
+                        self.render_file_preview(path, bytes, *line, flash.take(), tracked)
+                    }
                     Err(_) => diff_view::RenderedDiff::plain(diff_view::placeholder(
                         "Cannot read this file",
                     )),
@@ -1694,13 +1802,20 @@ impl Inner {
         bytes: &[u8],
         line: Option<usize>,
         flash: Option<Vec<MatchRange>>,
+        tracked: bool,
     ) -> diff_view::RenderedDiff {
         // Binary files have no textual preview.
         if bytes.iter().take(8192).any(|byte| *byte == 0) {
             return diff_view::RenderedDiff::plain(diff_view::placeholder("Binary file"));
         }
         let content = String::from_utf8_lossy(bytes);
-        let rendered = diff_view::render_file_preview(path, &content, &self.highlighter);
+        let rendered = diff_view::render_file_preview(
+            path,
+            &content,
+            &self.highlighter,
+            tracked,
+            &self.diff_callbacks(),
+        );
         // Reveal the requested line and flash its matches
         // (GITILANTE_SEARCH_SPEC.md section 22).
         if let (Some(line), Some(target)) = (line, rendered.targets.first()) {
@@ -1746,7 +1861,14 @@ impl Inner {
         oid: &str,
         diff: &Diff,
         focus: Option<&folding::FoldFocus>,
+        paths: Option<&[PathBuf]>,
     ) -> diff_view::RenderedDiff {
+        if paths.is_some_and(|paths| paths.is_empty()) {
+            log::debug!("File history entry {oid} has no reported paths");
+            return diff_view::RenderedDiff::plain(diff_view::placeholder(
+                "No file diff available for this history entry",
+            ));
+        }
         if diff.files.is_empty() {
             return diff_view::RenderedDiff::plain(diff_view::placeholder(
                 "No changes in this commit",
@@ -1759,6 +1881,13 @@ impl Inner {
         let box_ = GtkBox::new(Orientation::Vertical, 24);
         let mut targets = Vec::new();
         for file in &diff.files {
+            if paths.is_some_and(|paths| {
+                !paths.iter().any(|path| {
+                    file.old_path.as_ref() == Some(path) || file.new_path.as_ref() == Some(path)
+                })
+            }) {
+                continue;
+            }
             let rendered = diff_view::render(
                 file,
                 DiffSide::History,
@@ -1769,6 +1898,12 @@ impl Inner {
             );
             box_.append(&rendered.widget);
             targets.extend(rendered.targets);
+        }
+        if box_.first_child().is_none() {
+            log::debug!("No file diff matches the lineage paths in commit {oid}");
+            return diff_view::RenderedDiff::plain(diff_view::placeholder(
+                "No file diff available for this history entry",
+            ));
         }
         diff_view::RenderedDiff {
             widget: box_.upcast(),
@@ -1814,6 +1949,8 @@ impl Inner {
                     }
                 })
             },
+            file_history: op_callback(&weak, Inner::open_file_history),
+            preview_history: op_callback(&weak, Inner::open_preview_history),
             stage_file: op_callback(&weak, Inner::stage_file),
             unstage_file: op_callback(&weak, Inner::unstage_file),
             focus_hunk: op_callback(&weak, Inner::focus_hunk),
@@ -1914,6 +2051,43 @@ impl Inner {
 
     fn revert_hunk(&self, file: FileDiff, hunk: Hunk) {
         self.run_op(move |repo| repo.revert_commit_hunk(&file, &hunk));
+    }
+
+    fn open_file_history(&self, file: FileDiff) {
+        let Some(display_path) = file.path().map(Path::to_path_buf) else {
+            return;
+        };
+        let seed_path = if file.status == crate::model::diff::FileStatus::Renamed {
+            file.old_path.clone()
+        } else {
+            // A staged rename can have additional unstaged changes whose diff
+            // only mentions the new path; status still knows its HEAD path.
+            self.entry_for(&display_path).and_then(|entry| {
+                (entry.staged_change() == Some(crate::model::status::ChangeKind::Renamed))
+                    .then_some(entry.orig_path)
+                    .flatten()
+            })
+        }
+        .unwrap_or_else(|| display_path.clone());
+        self.set_history_mode(HistoryMode::File {
+            display_path,
+            seed_path,
+        });
+    }
+
+    fn open_preview_history(&self, display_path: PathBuf) {
+        let seed_path = self
+            .entry_for(&display_path)
+            .and_then(|entry| {
+                (entry.staged_change() == Some(crate::model::status::ChangeKind::Renamed))
+                    .then_some(entry.orig_path)
+                    .flatten()
+            })
+            .unwrap_or_else(|| display_path.clone());
+        self.set_history_mode(HistoryMode::File {
+            display_path,
+            seed_path,
+        });
     }
 
     fn stage_file(&self, path: PathBuf) {
@@ -2159,5 +2333,34 @@ fn toast_message(error: &Error) -> String {
             .next()
             .unwrap_or("Unknown error")
             .to_owned(),
+    }
+}
+
+#[cfg(test)]
+mod file_history_tests {
+    use super::*;
+
+    #[test]
+    fn mode_switch_invalidates_old_pages_and_resets_pagination() {
+        let mut state = State::default();
+        let repository_request = state.history_generation;
+        state.history_loading = true;
+        state.history_exhausted = true;
+        assert!(state.change_history_mode(HistoryMode::File {
+            display_path: PathBuf::from("a.txt"),
+            seed_path: PathBuf::from("old.txt"),
+        }));
+        assert_ne!(repository_request, state.history_generation);
+        assert!(!state.history_loading);
+        assert!(!state.history_exhausted);
+        let file_a_request = state.history_generation;
+        assert!(state.change_history_mode(HistoryMode::File {
+            display_path: PathBuf::from("b.txt"),
+            seed_path: PathBuf::from("b.txt"),
+        }));
+        assert_ne!(file_a_request, state.history_generation);
+        let file_b_request = state.history_generation;
+        assert!(state.change_history_mode(HistoryMode::Repository));
+        assert_ne!(file_b_request, state.history_generation);
     }
 }

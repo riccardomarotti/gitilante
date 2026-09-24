@@ -119,6 +119,16 @@ impl Repository {
         crate::git::files::untracked_files(self)
     }
 
+    /// File lineage from HEAD, including historical rename paths.
+    pub fn file_history(
+        &self,
+        path: &std::path::Path,
+        skip: usize,
+        max_count: usize,
+    ) -> Result<Vec<crate::git::history::FileHistoryEntry>> {
+        crate::git::history::file_history(self, path, skip, max_count)
+    }
+
     /// Diff of a single commit (SPEC §17).
     pub fn commit_diff(&self, oid: &str) -> Result<Diff> {
         enrich(crate::git::history::commit_diff(self, oid))

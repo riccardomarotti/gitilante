@@ -4,6 +4,10 @@
 //! separated record per commit. Commit diffs go through the same unified diff
 //! parser and renderer used for the working tree and the index.
 
+use std::ffi::OsString;
+use std::os::unix::ffi::OsStringExt;
+use std::path::{Path, PathBuf};
+
 use crate::git::Result;
 use crate::git::command;
 use crate::git::diff::STABLE_DIFF_FLAGS;
@@ -15,6 +19,13 @@ use crate::model::diff::Diff;
 /// Machine readable commit record: object name, parents, author name, author
 /// email, author time and subject, separated by NUL (one record per line).
 const LOG_FORMAT: &str = "%H%x00%P%x00%an%x00%ae%x00%at%x00%s";
+
+/// A commit touching a file, with the raw paths reported by `--name-status`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileHistoryEntry {
+    pub commit: Commit,
+    pub paths: Vec<PathBuf>,
+}
 
 /// Result of the output parsers, failing with a human-readable detail.
 type ParseResult<T> = std::result::Result<T, String>;
@@ -60,6 +71,128 @@ pub fn history(repo: &Repository, skip: usize, max_count: usize) -> Result<Vec<C
     })
 }
 
+/// Follows one file back from HEAD, retaining rename paths for diff filtering.
+pub fn file_history(
+    repo: &Repository,
+    path: &Path,
+    skip: usize,
+    max_count: usize,
+) -> Result<Vec<FileHistoryEntry>> {
+    if !head_exists(repo)? {
+        return Ok(Vec::new());
+    }
+    let mut args: Vec<OsString> = [
+        "log",
+        "--follow",
+        "-M",
+        "--no-decorate",
+        "--no-show-signature",
+        "--name-status",
+        "-z",
+        "--no-ext-diff",
+    ]
+    .into_iter()
+    .map(OsString::from)
+    .collect();
+    args.push(format!("--format={LOG_FORMAT}").into());
+    // `--skip` skips rename detection too: after a rename it loses the old
+    // path. Walk from HEAD on every page and slice the parsed lineage instead.
+    args.push(format!("--max-count={}", skip.saturating_add(max_count)).into());
+    args.push(OsString::from("HEAD"));
+    args.push(OsString::from("--"));
+    args.push(path.as_os_str().to_owned());
+    let output = command::run(repo.root(), &args)?;
+    let entries = parse_file_history(&output.stdout).map_err(|detail| Error::MalformedOutput {
+        command: "log --follow".to_owned(),
+        detail,
+    })?;
+    Ok(entries.into_iter().skip(skip).collect())
+}
+
+/// Parses NUL-separated commit fields and name-status entries. Only the
+/// separator between the commit metadata and its status records uses newlines;
+/// paths themselves are always read as complete NUL-terminated byte strings.
+pub fn parse_file_history(input: &[u8]) -> ParseResult<Vec<FileHistoryEntry>> {
+    let mut entries = Vec::new();
+    let mut cursor = 0;
+    while cursor < input.len() {
+        while cursor < input.len() && matches!(input[cursor], b'\n' | 0) {
+            cursor += 1;
+        }
+        if cursor == input.len() {
+            break;
+        }
+        let mut fields = Vec::new();
+        for _ in 0..6 {
+            fields.push(next_nul(input, &mut cursor)?);
+        }
+        let author_time = text(fields[4])?
+            .parse()
+            .map_err(|_| "invalid author time".to_owned())?;
+        let commit = Commit {
+            oid: text(fields[0])?,
+            parents: fields[1]
+                .split(|byte| *byte == b' ')
+                .filter(|value| !value.is_empty())
+                .map(text)
+                .collect::<ParseResult<Vec<_>>>()?,
+            author_name: String::from_utf8_lossy(fields[2]).into_owned(),
+            author_email: String::from_utf8_lossy(fields[3]).into_owned(),
+            author_time,
+            subject: String::from_utf8_lossy(fields[5]).into_owned(),
+        };
+        let mut paths = Vec::new();
+        loop {
+            // `-z` emits an empty token plus a newline before name-status.
+            while cursor < input.len() && matches!(input[cursor], b'\n' | 0) {
+                cursor += 1;
+            }
+            if cursor == input.len() {
+                break;
+            }
+            let token = next_nul(input, &mut cursor)?;
+            let status = token.strip_prefix(b"\n").unwrap_or(token);
+            if matches!(status.len(), 40 | 64) && status.iter().all(u8::is_ascii_hexdigit) {
+                // Next commit: rewind to the beginning of its object name.
+                cursor -= token.len() + 1;
+                break;
+            }
+            match status.first() {
+                Some(b'R' | b'C') => {
+                    paths.push(raw_path(next_nul(input, &mut cursor)?));
+                    paths.push(raw_path(next_nul(input, &mut cursor)?));
+                }
+                Some(b'A' | b'M' | b'D' | b'T' | b'U') => {
+                    paths.push(raw_path(next_nul(input, &mut cursor)?));
+                }
+                _ => {
+                    return Err(format!(
+                        "unexpected file status: {:?}",
+                        String::from_utf8_lossy(status)
+                    ));
+                }
+            }
+        }
+        entries.push(FileHistoryEntry { commit, paths });
+    }
+    Ok(entries)
+}
+
+fn next_nul<'a>(input: &'a [u8], cursor: &mut usize) -> ParseResult<&'a [u8]> {
+    let end = input[*cursor..]
+        .iter()
+        .position(|byte| *byte == 0)
+        .ok_or_else(|| "missing NUL delimiter".to_owned())?
+        + *cursor;
+    let value = &input[*cursor..end];
+    *cursor = end + 1;
+    Ok(value)
+}
+
+fn raw_path(bytes: &[u8]) -> PathBuf {
+    PathBuf::from(OsString::from_vec(bytes.to_vec()))
+}
+
 /// Diff of a single commit (`git show --format= --patch`).
 ///
 /// A merge commit is reviewed as the changes it brings into its first parent,
@@ -68,6 +201,7 @@ pub fn commit_diff(repo: &Repository, oid: &str) -> Result<Diff> {
     let mut args = vec!["-c".to_owned(), "core.quotePath=true".to_owned()];
     if parent_count(repo, oid)? > 1 {
         args.push("diff".to_owned());
+        args.push("-M".to_owned());
         args.extend(STABLE_DIFF_FLAGS.iter().map(|flag| (*flag).to_owned()));
         args.push(format!("{oid}^1"));
         args.push(oid.to_owned());
@@ -75,6 +209,7 @@ pub fn commit_diff(repo: &Repository, oid: &str) -> Result<Diff> {
         args.push("show".to_owned());
         args.push("--format=".to_owned());
         args.push("--patch".to_owned());
+        args.push("-M".to_owned());
         args.extend(STABLE_DIFF_FLAGS.iter().map(|flag| (*flag).to_owned()));
         args.push(oid.to_owned());
     }

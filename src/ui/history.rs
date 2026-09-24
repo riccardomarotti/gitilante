@@ -5,6 +5,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
+use std::path::Path;
 use std::rc::Rc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -23,6 +24,8 @@ pub struct Callbacks {
     pub select: Box<dyn Fn(Selection)>,
     /// The user asked for the next block of commits.
     pub load_more: Box<dyn Fn()>,
+    /// Return to the unfiltered repository history.
+    pub all_history: Box<dyn Fn()>,
 }
 
 /// State shared with the list's signal handlers.
@@ -38,6 +41,9 @@ struct Shared {
 pub struct HistoryView {
     root: GtkBox,
     list: ListBox,
+    header: Label,
+    path_label: Label,
+    all_button: Button,
     shared: Rc<Shared>,
 }
 
@@ -50,7 +56,21 @@ impl HistoryView {
         header.set_margin_top(12);
         header.set_margin_bottom(4);
         header.set_margin_start(6);
-        root.append(&header);
+        let header_row = GtkBox::new(Orientation::Horizontal, 6);
+        header.set_hexpand(true);
+        header_row.append(&header);
+        let all_button = Button::with_label("All history");
+        all_button.add_css_class("flat");
+        all_button.set_visible(false);
+        header_row.append(&all_button);
+        root.append(&header_row);
+        let path_label = Label::new(None);
+        path_label.set_xalign(0.0);
+        path_label.set_ellipsize(pango::EllipsizeMode::Middle);
+        path_label.set_margin_start(6);
+        path_label.set_margin_bottom(4);
+        path_label.set_visible(false);
+        root.append(&path_label);
 
         let list = ListBox::new();
         list.set_selection_mode(SelectionMode::Single);
@@ -85,7 +105,19 @@ impl HistoryView {
             });
         }
 
-        Self { root, list, shared }
+        {
+            let shared = shared.clone();
+            all_button.connect_clicked(move |_| (shared.callbacks.all_history)());
+        }
+
+        Self {
+            root,
+            list,
+            header,
+            path_label,
+            all_button,
+            shared,
+        }
     }
 
     /// The view widget (header included).
@@ -117,7 +149,20 @@ impl HistoryView {
         selection: Option<&Selection>,
         loading: bool,
         exhausted: bool,
+        file_path: Option<&Path>,
     ) {
+        self.header.set_text(if file_path.is_some() {
+            "File History"
+        } else {
+            "History"
+        });
+        self.all_button.set_visible(file_path.is_some());
+        self.path_label.set_visible(file_path.is_some());
+        if let Some(path) = file_path {
+            let display = path.display().to_string();
+            self.path_label.set_text(&display);
+            self.path_label.set_tooltip_text(Some(&display));
+        }
         self.shared.rebuilding.set(true);
         while let Some(row) = self.list.row_at_index(0) {
             self.list.remove(&row);
@@ -126,8 +171,23 @@ impl HistoryView {
         items.clear();
 
         for (commit, row_graph) in commits.iter().zip(&graph.rows) {
-            self.push_commit(commit, row_graph, graph.max_lanes, refs, head, dark);
+            self.push_commit(
+                commit,
+                file_path.is_none().then_some(row_graph),
+                graph.max_lanes,
+                refs,
+                head,
+                dark,
+            );
             items.push(Some(Selection::Commit(commit.oid.clone())));
+        }
+        if commits.is_empty() && exhausted && file_path.is_some() {
+            let row = ListBoxRow::new();
+            row.set_selectable(false);
+            row.set_activatable(false);
+            row.set_child(Some(&Label::new(Some("No commits found for this file"))));
+            self.list.append(&row);
+            items.push(None);
         }
 
         if !exhausted {
@@ -154,7 +214,7 @@ impl HistoryView {
     fn push_commit(
         &self,
         commit: &Commit,
-        row_graph: &GraphRow,
+        row_graph: Option<&GraphRow>,
         max_lanes: usize,
         refs: &HashMap<String, Vec<CommitRef>>,
         head: Option<&HeadRef>,
@@ -166,7 +226,9 @@ impl HistoryView {
         // The gutter has no margins: it must cover the whole row height so the
         // lanes never break between rows (BRANCH.md section 35).
         let outer = GtkBox::new(Orientation::Horizontal, 0);
-        outer.append(&graph_gutter::new(row_graph, max_lanes, dark));
+        if let Some(row_graph) = row_graph {
+            outer.append(&graph_gutter::new(row_graph, max_lanes, dark));
+        }
 
         let box_ = GtkBox::new(Orientation::Vertical, 2);
         box_.set_margin_top(6);

@@ -47,6 +47,10 @@ pub struct Callbacks {
     /// Discard the working tree changes of the given path (the caller asks for
     /// confirmation first).
     pub discard_file: Box<dyn Fn(PathBuf)>,
+    /// Enter the selected file's HEAD history.
+    pub file_history: Box<dyn Fn(FileDiff)>,
+    /// Open the HEAD history of a tracked file preview.
+    pub preview_history: Box<dyn Fn(PathBuf)>,
     /// Toggle the folding of a file (GITILANTE_DIFF_FOLDING_SPEC.md §23).
     pub toggle_file: Box<dyn Fn(FileFoldKey)>,
     /// Toggle the folding of a hunk.
@@ -186,6 +190,8 @@ pub fn render_file_preview(
     path: &std::path::Path,
     content: &str,
     highlighter: &Highlighter,
+    tracked: bool,
+    callbacks: &Rc<Callbacks>,
 ) -> RenderedDiff {
     /// Large files are truncated: a preview is never a full editor.
     const MAX_PREVIEW_LINES: usize = 5000;
@@ -204,6 +210,15 @@ pub fn render_file_preview(
     hint.add_css_class("dim-label");
     hint.add_css_class("caption");
     header.append(&hint);
+    if tracked {
+        let history = file_button("History", {
+            let path = path.to_path_buf();
+            let callbacks = callbacks.clone();
+            move || (callbacks.preview_history)(path.clone())
+        });
+        history.set_tooltip_text(Some("Show history of this file"));
+        header.append(&history);
+    }
     root.append(&header);
 
     let lines: Vec<String> = content
@@ -371,6 +386,15 @@ fn file_header(
 
     header.append(&stats_label(file.stats()));
 
+    if matches!(side, DiffSide::Staged | DiffSide::Unstaged) {
+        let history = file_button("History", {
+            let file = file.clone();
+            let callbacks = callbacks.clone();
+            move || (callbacks.file_history)(file.clone())
+        });
+        history.set_tooltip_text(Some("Show history of this file"));
+        header.append(&history);
+    }
     match side {
         DiffSide::Staged => {
             header.append(&file_button("Unstage file", {
