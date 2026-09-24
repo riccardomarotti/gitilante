@@ -21,12 +21,12 @@ use libadwaita::prelude::*;
 use crate::conflict::presentation::ConflictPresentation;
 use crate::conflict::resolution::ConflictResolution;
 use crate::git::Error;
-use crate::git::conflict::ConflictLoad;
+use crate::git::conflict::{ApplyAction, ApplyOutcome, ConflictLoad};
 use crate::git::repository::Repository;
 use crate::model::commit::Commit;
 use crate::model::diff::{Diff, FileDiff, Hunk};
 use crate::model::refs::{CommitRef, HeadRef};
-use crate::model::status::{Status, StatusEntry};
+use crate::model::status::{Status, StatusEntry, UnmergedInfo};
 use crate::search::SearchQuery;
 use crate::search::SearchScope;
 use crate::search::result::{
@@ -944,11 +944,6 @@ impl Inner {
 
     /// Applies the resolution: writes the file and stages it (§43-44).
     fn apply_conflict(&self) {
-        enum Outcome {
-            Write(Vec<u8>),
-            Stage,
-            Delete,
-        }
         let prepared = {
             let state = self.state.borrow();
             let Some(Selection::Conflicted(path)) = state.selection.clone() else {
@@ -958,68 +953,106 @@ impl Inner {
                 return;
             };
             let session = session.borrow();
-            let outcome = match &session.load.presentation {
+            let action = match &session.load.presentation {
                 ConflictPresentation::TextBlocks(file) => {
                     match file.build_resolved(&session.resolutions) {
-                        Ok(bytes) => Outcome::Write(bytes),
+                        Ok(bytes) => ApplyAction::Write(bytes),
                         Err(_) => return, // §38: apply is enabled only when complete
                     }
                 }
                 ConflictPresentation::KeepOrDelete { .. } => match session.file_choice {
-                    conflict_view::FileChoice::KeepFile => Outcome::Stage,
-                    conflict_view::FileChoice::DeleteFile => Outcome::Delete,
+                    conflict_view::FileChoice::KeepFile => ApplyAction::Stage,
+                    conflict_view::FileChoice::DeleteFile => ApplyAction::Delete,
                     _ => return,
                 },
-                ConflictPresentation::ResolveAsDeleted => Outcome::Delete,
+                ConflictPresentation::ResolveAsDeleted => ApplyAction::Delete,
                 ConflictPresentation::WholeFileChoice {
                     version_a,
                     version_b,
                 } => match session.file_choice {
                     conflict_view::FileChoice::UseVersionA => {
-                        Outcome::Write(version_a.bytes.clone())
+                        ApplyAction::Write(version_a.bytes.clone())
                     }
                     conflict_view::FileChoice::UseVersionB => {
-                        Outcome::Write(version_b.bytes.clone())
+                        ApplyAction::Write(version_b.bytes.clone())
                     }
                     _ => return,
                 },
-                ConflictPresentation::AlreadyManuallyResolved => Outcome::Stage,
+                ConflictPresentation::AlreadyManuallyResolved => ApplyAction::Stage,
                 ConflictPresentation::Unsupported(_) => return,
             };
-            (path, session.load.working_tree.clone(), outcome)
+            (
+                path,
+                session.load.unmerged.clone(),
+                session.load.working_tree.clone(),
+                action,
+            )
         };
-        let (path, snapshot, outcome) = prepared;
+        let (path, expected, snapshot, action) = prepared;
+        self.run_conflict_apply(path, expected, snapshot, action);
+    }
 
-        // §39-40: external modifications are never overwritten.
-        match self
-            .repo
-            .conflict_file_unchanged(&path, snapshot.as_deref())
-        {
-            Ok(true) => {}
-            Ok(false) => {
+    /// Stages the current content as the resolution (§41).
+    fn mark_conflict_resolved(&self) {
+        let prepared = {
+            let state = self.state.borrow();
+            let Some(Selection::Conflicted(path)) = state.selection.clone() else {
+                return;
+            };
+            let Some(session) = state.conflict_sessions.get(&path).cloned() else {
+                return;
+            };
+            let session = session.borrow();
+            (
+                path,
+                session.load.unmerged.clone(),
+                session.load.working_tree.clone(),
+            )
+        };
+        let (path, expected, snapshot) = prepared;
+        self.run_conflict_apply(path, expected, snapshot, ApplyAction::Stage);
+    }
+
+    /// Runs the guarded apply on the worker thread (§39-44, §89).
+    ///
+    /// File and conflict stages are re-verified inside the same task that
+    /// applies, so nothing can change between the check and the index update.
+    fn run_conflict_apply(
+        &self,
+        path: PathBuf,
+        expected: UnmergedInfo,
+        snapshot: Option<Vec<u8>>,
+        action: ApplyAction,
+    ) {
+        self.busy_start();
+        let repo = self.repo.clone();
+        let weak = self.self_weak.clone();
+        let path_for_result = path.clone();
+        self.worker.run(
+            move || repo.resolve_conflict(&path, &expected, snapshot.as_deref(), action),
+            move |result| {
+                if let Some(inner) = weak.upgrade() {
+                    inner.finish_conflict_apply(path_for_result, result);
+                }
+            },
+        );
+    }
+
+    /// Completes a guarded apply (§39-44).
+    fn finish_conflict_apply(&self, path: PathBuf, result: Result<ApplyOutcome, Error>) {
+        self.busy_finish();
+        match result {
+            Ok(ApplyOutcome::Applied) => {
+                self.state.borrow_mut().conflict_sessions.remove(&path);
+                self.refresh();
+            }
+            Ok(ApplyOutcome::Stale) => {
                 self.state.borrow_mut().conflict_sessions.remove(&path);
                 let toast = adw::Toast::new(
-                    "The file changed since the conflict solver was opened.\nRefresh the conflict before applying the resolution.",
+                    "The file or its conflict stages changed since the conflict solver was opened.\nRefresh the conflict and resolve it again.",
                 );
                 toast.set_timeout(8);
                 self.toast_overlay.add_toast(toast);
-                self.refresh();
-                return;
-            }
-            Err(error) => {
-                self.show_error(&error);
-                return;
-            }
-        }
-
-        let result = match outcome {
-            Outcome::Write(bytes) => self.repo.apply_conflict_resolution(&path, &bytes),
-            Outcome::Stage => self.repo.mark_resolved(&path),
-            Outcome::Delete => self.repo.mark_deleted(&path),
-        };
-        match result {
-            Ok(()) => {
-                self.state.borrow_mut().conflict_sessions.remove(&path);
                 self.refresh();
             }
             Err(Error::Git(git_error)) => {
@@ -1030,24 +1063,6 @@ impl Inner {
                 );
                 toast.set_timeout(8);
                 self.toast_overlay.add_toast(toast);
-                self.refresh();
-            }
-            Err(error) => self.show_error(&error),
-        }
-    }
-
-    /// Stages the current content as the resolution (§41).
-    fn mark_conflict_resolved(&self) {
-        let path = {
-            let state = self.state.borrow();
-            match &state.selection {
-                Some(Selection::Conflicted(path)) => path.clone(),
-                _ => return,
-            }
-        };
-        match self.repo.mark_resolved(&path) {
-            Ok(()) => {
-                self.state.borrow_mut().conflict_sessions.remove(&path);
                 self.refresh();
             }
             Err(error) => self.show_error(&error),

@@ -224,3 +224,59 @@ pub fn mark_deleted(repo: &Repository, path: &Path) -> Result<()> {
     command::run(repo.root(), &args)?;
     Ok(())
 }
+
+/// Action that finalizes a conflict resolution (§43-45).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ApplyAction {
+    /// Write these bytes to the working tree and stage the path (§43).
+    Write(Vec<u8>),
+    /// Stage the current working tree content without editing it (§41).
+    Stage,
+    /// Resolve the conflict by deleting the file (§45).
+    Delete,
+}
+
+/// Result of a guarded apply (§39-40).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApplyOutcome {
+    /// The resolution was applied and the path staged.
+    Applied,
+    /// The file or its conflict stages changed since the solver opened them:
+    /// nothing was modified.
+    Stale,
+}
+
+/// Applies a resolution after re-verifying the conflict is still the one the
+/// solver opened (§39-40).
+///
+/// The working tree content and the index stages are checked immediately
+/// before touching anything: when either changed, nothing is written or
+/// staged and the outcome reports the conflict as stale.
+pub fn apply_resolution_checked(
+    repo: &Repository,
+    path: &Path,
+    expected: &UnmergedInfo,
+    snapshot: Option<&[u8]>,
+    action: ApplyAction,
+) -> Result<ApplyOutcome> {
+    if !unchanged_since(repo, path, snapshot)? || !same_conflict_stages(repo, path, expected)? {
+        return Ok(ApplyOutcome::Stale);
+    }
+    match action {
+        ApplyAction::Write(bytes) => apply_resolution(repo, path, &bytes)?,
+        ApplyAction::Stage => mark_resolved(repo, path)?,
+        ApplyAction::Delete => mark_deleted(repo, path)?,
+    }
+    Ok(ApplyOutcome::Applied)
+}
+
+/// True when the path is still unmerged with the same codes, modes and OIDs.
+fn same_conflict_stages(repo: &Repository, path: &Path, expected: &UnmergedInfo) -> Result<bool> {
+    let repository_status = status::status(repo)?;
+    let current = repository_status
+        .entries
+        .iter()
+        .find(|entry| entry.path == path)
+        .and_then(|entry| entry.unmerged());
+    Ok(current == Some(expected))
+}

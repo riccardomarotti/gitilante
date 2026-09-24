@@ -507,3 +507,85 @@ fn intraline_marks_highlight_the_changed_parts() {
     assert!(marks_a.iter().all(|spans| spans.is_empty()));
     assert!(marks_b.iter().all(|spans| spans.is_empty()));
 }
+
+/// §39-40 — marking resolved also refuses externally changed files.
+#[test]
+fn guarded_mark_resolved_refuses_external_changes() {
+    use gitilante::git::conflict::{ApplyAction, ApplyOutcome};
+
+    let repo = add_add_conflict("added.txt", b"our content\n", b"their content\n");
+    let backend = Backend::discover(Path::new(repo.root())).unwrap();
+    let path = Path::new("added.txt");
+    let load = backend.conflict(path).unwrap().unwrap();
+
+    repo.write("added.txt", b"changed outside\n");
+    let outcome = backend
+        .resolve_conflict(
+            path,
+            &load.unmerged,
+            load.working_tree.as_deref(),
+            ApplyAction::Stage,
+        )
+        .unwrap();
+    assert_eq!(outcome, ApplyOutcome::Stale);
+    // Nothing was staged or rewritten (§40).
+    assert_eq!(
+        std::fs::read(repo.root().join("added.txt")).unwrap(),
+        b"changed outside\n"
+    );
+    assert_eq!(backend.status().unwrap().unmerged_entries().count(), 1);
+}
+
+/// §39-40 — a guarded apply also refuses conflicts whose stages moved on.
+#[test]
+fn guarded_apply_refuses_changed_stages() {
+    use gitilante::git::conflict::{ApplyAction, ApplyOutcome};
+
+    let repo = add_add_conflict("added.txt", b"our content\n", b"their content\n");
+    let backend = Backend::discover(Path::new(repo.root())).unwrap();
+    let path = Path::new("added.txt");
+    let load = backend.conflict(path).unwrap().unwrap();
+
+    // Someone resolves the conflict in the index meanwhile: the stages of the
+    // session no longer exist, so the solver must do nothing.
+    repo.git(&["add", "added.txt"]);
+    let outcome = backend
+        .resolve_conflict(
+            path,
+            &load.unmerged,
+            load.working_tree.as_deref(),
+            ApplyAction::Write(b"resolved\n".to_vec()),
+        )
+        .unwrap();
+    assert_eq!(outcome, ApplyOutcome::Stale);
+    assert_ne!(
+        std::fs::read(repo.root().join("added.txt")).unwrap(),
+        b"resolved\n"
+    );
+}
+
+/// §43 — the guarded apply writes and stages when nothing changed.
+#[test]
+fn guarded_apply_succeeds_when_unchanged() {
+    use gitilante::git::conflict::{ApplyAction, ApplyOutcome};
+
+    let repo = add_add_conflict("added.txt", b"our content\n", b"their content\n");
+    let backend = Backend::discover(Path::new(repo.root())).unwrap();
+    let path = Path::new("added.txt");
+    let load = backend.conflict(path).unwrap().unwrap();
+
+    let outcome = backend
+        .resolve_conflict(
+            path,
+            &load.unmerged,
+            load.working_tree.as_deref(),
+            ApplyAction::Write(b"resolved\n".to_vec()),
+        )
+        .unwrap();
+    assert_eq!(outcome, ApplyOutcome::Applied);
+    assert_eq!(backend.status().unwrap().unmerged_entries().count(), 0);
+    assert_eq!(
+        std::fs::read(repo.root().join("added.txt")).unwrap(),
+        b"resolved\n"
+    );
+}

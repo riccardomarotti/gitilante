@@ -13,7 +13,7 @@ use crate::git::patch::{self, ApplyTarget};
 use crate::model::commit::Commit;
 use crate::model::diff::{Diff, FileDiff, Hunk};
 use crate::model::refs::{CommitRef, HeadRef};
-use crate::model::status::{Status, StatusEntry};
+use crate::model::status::{Status, StatusEntry, UnmergedInfo};
 
 /// Adds the purely derived visual metadata (intraline spans) to a freshly
 /// loaded diff (DIFF.md sections 30 and 32).
@@ -229,6 +229,18 @@ impl Repository {
     /// Resolves a file-level conflict by deleting the file (§45).
     pub fn mark_deleted(&self, path: &Path) -> Result<()> {
         conflict::mark_deleted(self, path)
+    }
+
+    /// Applies a conflict action after re-verifying the file and the conflict
+    /// stages are still the ones the solver opened (§39-40).
+    pub fn resolve_conflict(
+        &self,
+        path: &Path,
+        expected: &UnmergedInfo,
+        snapshot: Option<&[u8]>,
+        action: conflict::ApplyAction,
+    ) -> Result<conflict::ApplyOutcome> {
+        conflict::apply_resolution_checked(self, path, expected, snapshot, action)
     }
 
     /// Runs a command on the entry's path, adding the original path of a
