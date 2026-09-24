@@ -11,7 +11,10 @@ use std::path::PathBuf;
 use crate::git::command;
 use crate::git::error::Error;
 use crate::git::repository::Repository;
-use crate::model::status::{BranchInfo, ChangeKind, Head, Status, StatusEntry, StatusEntryKind};
+use crate::model::status::{
+    BranchInfo, ChangeKind, ConflictStage, Head, Status, StatusEntry, StatusEntryKind,
+    SubmoduleState, UnmergedCode, UnmergedInfo,
+};
 
 /// Result of the output parsers, failing with a human-readable detail.
 type ParseResult<T> = std::result::Result<T, String>;
@@ -153,13 +156,65 @@ fn parse_renamed(record: &[u8], orig_path: &[u8]) -> ParseResult<StatusEntry> {
 }
 
 /// Parses an unmerged entry: `u XY sub m1 m2 m3 mW h1 h2 h3 <path>`.
+///
+/// Every stage field is preserved: the conflict solver reads the stage blobs
+/// through these OIDs and needs the modes to detect special file conflicts.
 fn parse_unmerged(record: &[u8]) -> ParseResult<StatusEntry> {
     let fields = split_fields(record, 11)?;
     Ok(StatusEntry {
         path: path(fields[10]),
         orig_path: None,
-        kind: StatusEntryKind::Unmerged,
+        kind: StatusEntryKind::Unmerged(UnmergedInfo {
+            code: UnmergedCode::from_xy(fields[1])?,
+            submodule: parse_submodule_state(fields[2])?,
+            base: parse_stage(fields[3], fields[7])?,
+            stage2: parse_stage(fields[4], fields[8])?,
+            stage3: parse_stage(fields[5], fields[9])?,
+            worktree_mode: parse_mode(fields[6])?,
+        }),
     })
+}
+
+/// Parses the four-character submodule state field (`N...` or `S<c><m><u>`).
+fn parse_submodule_state(raw: &[u8]) -> ParseResult<SubmoduleState> {
+    match raw {
+        [b'N', ..] => Ok(SubmoduleState::NotSubmodule),
+        [b'S', commit, tracked, untracked] => Ok(SubmoduleState::Submodule {
+            commit: *commit,
+            tracked: *tracked,
+            untracked: *untracked,
+        }),
+        other => Err(format!(
+            "malformed submodule state: {:?}",
+            String::from_utf8_lossy(other)
+        )),
+    }
+}
+
+/// Parses one `<mode> <oid>` stage pair; an all-zero mode or OID means the
+/// stage does not exist and is represented as `None`.
+fn parse_stage(mode: &[u8], oid: &[u8]) -> ParseResult<ConflictStage> {
+    Ok(ConflictStage {
+        mode: parse_mode(mode)?,
+        oid: parse_oid(oid)?,
+    })
+}
+
+/// Parses an octal file mode; `000000` (no file at this stage) maps to `None`.
+fn parse_mode(raw: &[u8]) -> ParseResult<Option<u32>> {
+    let digits = utf8(raw)?;
+    let mode =
+        u32::from_str_radix(&digits, 8).map_err(|_| format!("malformed mode: {digits:?}"))?;
+    Ok(if mode == 0 { None } else { Some(mode) })
+}
+
+/// Parses a hex OID; an all-zero OID (missing stage) maps to `None`.
+fn parse_oid(raw: &[u8]) -> ParseResult<Option<String>> {
+    if raw.iter().all(|byte| *byte == b'0') {
+        Ok(None)
+    } else {
+        Ok(Some(utf8(raw)?))
+    }
 }
 
 /// Parses a flagged entry: `? <path>` (untracked) or `! <path>` (ignored).
@@ -350,5 +405,93 @@ mod tests {
     fn empty_input_is_a_clean_repository() {
         let status = parse(&[]).unwrap();
         assert!(status.entries.is_empty());
+    }
+
+    /// Full `u` record with every stage present.
+    const UU_RECORD: &[u8] = b"u UU N... 100644 100644 100644 100644 1111111111111111111111111111111111111111 2222222222222222222222222222222222222222 3333333333333333333333333333333333333333 file.txt";
+
+    #[test]
+    fn parses_unmerged_stage_metadata() {
+        let status = parse(&records(&[UU_RECORD])).unwrap();
+        let info = status.entries[0].unmerged().unwrap();
+        assert_eq!(info.code, UnmergedCode::BothModified);
+        assert_eq!(info.submodule, SubmoduleState::NotSubmodule);
+        assert_eq!(
+            info.base,
+            ConflictStage {
+                mode: Some(0o100644),
+                oid: Some("1111111111111111111111111111111111111111".to_owned())
+            }
+        );
+        assert_eq!(
+            info.stage2,
+            ConflictStage {
+                mode: Some(0o100644),
+                oid: Some("2222222222222222222222222222222222222222".to_owned())
+            }
+        );
+        assert_eq!(
+            info.stage3,
+            ConflictStage {
+                mode: Some(0o100644),
+                oid: Some("3333333333333333333333333333333333333333".to_owned())
+            }
+        );
+        assert_eq!(info.worktree_mode, Some(0o100644));
+    }
+
+    #[test]
+    fn parses_every_unmerged_code() {
+        for (xy, code) in [
+            (b"UU", UnmergedCode::BothModified),
+            (b"AA", UnmergedCode::BothAdded),
+            (b"AU", UnmergedCode::AddedByUs),
+            (b"UA", UnmergedCode::AddedByThem),
+            (b"DU", UnmergedCode::DeletedByUs),
+            (b"UD", UnmergedCode::DeletedByThem),
+            (b"DD", UnmergedCode::BothDeleted),
+        ] {
+            let mut record = UU_RECORD.to_vec();
+            record[2..4].copy_from_slice(xy);
+            let status = parse(&records(&[&record])).unwrap();
+            assert_eq!(status.entries[0].unmerged().unwrap().code, code);
+            assert_eq!(code.as_xy().as_bytes(), *xy);
+        }
+    }
+
+    #[test]
+    fn absent_stages_are_none() {
+        // Deleted by us: stage 3 has no mode and an all-zero OID.
+        let status = parse(&records(&[
+            b"u DU N... 100644 100644 000000 0 1111111111111111111111111111111111111111 2222222222222222222222222222222222222222 0000000000000000000000000000000000000000 file.txt",
+        ]))
+        .unwrap();
+        let info = status.entries[0].unmerged().unwrap();
+        assert_eq!(info.worktree_mode, None);
+        assert!(info.stage3.is_absent());
+        assert_eq!(info.stage3, ConflictStage::default());
+        assert!(!info.stage2.is_absent());
+    }
+
+    #[test]
+    fn parses_submodule_state_letters() {
+        let mut record = UU_RECORD.to_vec();
+        record[5..9].copy_from_slice(b"SMU.");
+        let status = parse(&records(&[&record])).unwrap();
+        assert_eq!(
+            status.entries[0].unmerged().unwrap().submodule,
+            SubmoduleState::Submodule {
+                commit: b'M',
+                tracked: b'U',
+                untracked: b'.'
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_unmerged_code() {
+        let mut record = UU_RECORD.to_vec();
+        record[2..4].copy_from_slice(b"XU");
+        assert!(parse(&records(&[&record])).is_err());
     }
 }

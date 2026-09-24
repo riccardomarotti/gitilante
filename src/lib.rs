@@ -3,6 +3,7 @@
 //! The UI layer must go through this crate and never run `git` directly, so
 //! that every Git operation stays testable without GTK.
 
+pub mod conflict;
 pub mod git;
 pub mod graph;
 pub mod intraline;
