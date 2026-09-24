@@ -35,8 +35,8 @@ use crate::search::result::{
 };
 use crate::ui::worker::Worker;
 use crate::ui::{
-    DiffSide, HunkTarget, Selection, changes, clipboard, conflict_view, diff_view, folding,
-    history, search, search_dialog, short_path,
+    DiffSide, HunkTarget, Selection, changes, clipboard, conflict_view, diff_view, external_editor,
+    folding, history, search, search_dialog, short_path,
 };
 
 /// Commits per history block (SPEC section 16).
@@ -217,6 +217,7 @@ impl Inner {
 
         let changes = changes::ChangesView::new(changes::Callbacks {
             copy: op_callback(&self_weak, Inner::copy_action),
+            open_editor: op_callback(&self_weak, Inner::open_in_editor),
             select: {
                 let weak = self_weak.clone();
                 Box::new(move |selection| {
@@ -1038,6 +1039,7 @@ impl Inner {
             })
         };
         Rc::new(conflict_view::Callbacks {
+            open_editor: op_callback(&self.self_weak, Inner::open_in_editor),
             choose,
             reset,
             toggle_collapse,
@@ -1925,6 +1927,7 @@ impl Inner {
         let weak = self.self_weak.clone();
         Rc::new(diff_view::Callbacks {
             copy: op_callback(&weak, Inner::copy_action),
+            open_editor: op_callback(&weak, Inner::open_in_editor),
             stage_hunk: op2_callback(&weak, Inner::stage_hunk),
             unstage_hunk: op2_callback(&weak, Inner::unstage_hunk),
             discard_hunk: {
@@ -1990,6 +1993,18 @@ impl Inner {
                 })
             },
         })
+    }
+
+    fn open_in_editor(&self, path: PathBuf) {
+        if let Err(error) = external_editor::open(self.repo.root(), &path) {
+            log::warn!(
+                "Could not open external editor for {}: {error:?}",
+                path.display()
+            );
+            let toast = adw::Toast::new(error.message());
+            toast.set_timeout(5);
+            self.toast_overlay.add_toast(toast);
+        }
     }
 
     // --- clipboard -------------------------------------------------------

@@ -5,6 +5,7 @@ pub mod changes;
 pub mod clipboard;
 pub mod conflict_view;
 pub mod diff_view;
+pub mod external_editor;
 pub mod folding;
 pub mod graph_gutter;
 pub mod history;

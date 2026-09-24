@@ -18,6 +18,7 @@ use crate::ui::{Selection, change_letter, display_name};
 /// User actions available from the sidebar.
 pub struct Callbacks {
     pub copy: Box<dyn Fn(CopyAction)>,
+    pub open_editor: Box<dyn Fn(PathBuf)>,
     /// A row was selected.
     pub select: Box<dyn Fn(Selection)>,
     /// Stage every change of the given path.
@@ -223,9 +224,15 @@ impl ChangesView {
         let absolute_path = path.clone();
         let shared = self.shared.clone();
         let absolute_shared = self.shared.clone();
+        let editor_shared = self.shared.clone();
+        let editor_path = entry.path.clone();
         clipboard::context_menu(
             &row,
             vec![
+                (
+                    "Open in Editor",
+                    Box::new(move || (editor_shared.callbacks.open_editor)(editor_path.clone())),
+                ),
                 (
                     "Copy path",
                     Box::new(move || (shared.callbacks.copy)(CopyAction::Path(path.clone()))),

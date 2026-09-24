@@ -28,6 +28,8 @@ use crate::ui::{DiffSide, HunkTarget, display_name};
 pub struct Callbacks {
     /// Copy an existing model payload to the clipboard.
     pub copy: Box<dyn Fn(CopyAction)>,
+    /// Open the current working-tree file, never a historical snapshot.
+    pub open_editor: Box<dyn Fn(PathBuf)>,
     /// Stage one hunk of a working tree diff.
     pub stage_hunk: Box<dyn Fn(FileDiff, Hunk)>,
     /// Unstage one hunk of a staged diff.
@@ -176,6 +178,17 @@ pub fn render_untracked(path: &std::path::Path, callbacks: &Rc<Callbacks>) -> Re
         move || (callbacks.stage_file)(path.clone())
     });
     header.append(&stage);
+    let editor_path = path.to_path_buf();
+    let editor_callbacks = callbacks.clone();
+    clipboard::context_menu(
+        &header,
+        vec![(
+            "Open in Editor",
+            Box::new(move || {
+                (editor_callbacks.open_editor)(editor_path.clone());
+            }),
+        )],
+    );
     root.append(&header);
     root.append(&placeholder(
         "Untracked file: stage it to work on its changes",
@@ -213,6 +226,8 @@ pub fn render_file_preview(
     hint.add_css_class("dim-label");
     hint.add_css_class("caption");
     header.append(&hint);
+    let editor_path = path.to_path_buf();
+    let editor_callbacks = callbacks.clone();
     let path_for_copy = path.to_path_buf();
     let absolute_path = path.to_path_buf();
     let copy_callbacks = callbacks.clone();
@@ -220,6 +235,10 @@ pub fn render_file_preview(
     clipboard::context_menu(
         &header,
         vec![
+            (
+                "Open in Editor",
+                Box::new(move || (editor_callbacks.open_editor)(editor_path.clone())),
+            ),
             (
                 "Copy path",
                 Box::new(move || (copy_callbacks.copy)(CopyAction::Path(path_for_copy.clone()))),
@@ -423,33 +442,44 @@ fn file_header(
         let absolute_path = path.clone();
         let file_for_diff = file.clone();
         let copy_path = callbacks.clone();
+        let editor_callbacks = callbacks.clone();
+        let editor_path = path.clone();
         let copy_absolute = callbacks.clone();
         let copy_diff = callbacks.clone();
-        clipboard::context_menu(
-            &header,
-            vec![
-                (
-                    "Copy path",
-                    Box::new(move || {
-                        if let Some(path) = &path {
-                            (copy_path.copy)(CopyAction::Path(path.clone()));
-                        }
-                    }),
-                ),
-                (
-                    "Copy absolute path",
-                    Box::new(move || {
-                        if let Some(path) = &absolute_path {
-                            (copy_absolute.copy)(CopyAction::AbsolutePath(path.clone()));
-                        }
-                    }),
-                ),
-                (
-                    "Copy diff",
-                    Box::new(move || (copy_diff.copy)(CopyAction::FileDiff(file_for_diff.clone()))),
-                ),
-            ],
-        );
+        let mut items: Vec<clipboard::MenuAction> = Vec::new();
+        if matches!(side, DiffSide::Staged | DiffSide::Unstaged) {
+            items.push((
+                "Open in Editor",
+                Box::new(move || {
+                    if let Some(path) = &editor_path {
+                        (editor_callbacks.open_editor)(path.clone());
+                    }
+                }),
+            ));
+        }
+        items.extend([
+            (
+                "Copy path",
+                Box::new(move || {
+                    if let Some(path) = &path {
+                        (copy_path.copy)(CopyAction::Path(path.clone()));
+                    }
+                }),
+            ),
+            (
+                "Copy absolute path",
+                Box::new(move || {
+                    if let Some(path) = &absolute_path {
+                        (copy_absolute.copy)(CopyAction::AbsolutePath(path.clone()));
+                    }
+                }),
+            ),
+            (
+                "Copy diff",
+                Box::new(move || (copy_diff.copy)(CopyAction::FileDiff(file_for_diff.clone()))),
+            ),
+        ] as [clipboard::MenuAction; 3]);
+        clipboard::context_menu(&header, items);
     }
     match side {
         DiffSide::Staged => {

@@ -18,6 +18,7 @@ use crate::conflict::presentation::{ConflictPresentation, ConflictSide, intralin
 use crate::conflict::resolution::ConflictResolution;
 use crate::git::conflict::ConflictLoad;
 use crate::syntax::Highlighter;
+use crate::ui::clipboard;
 use crate::ui::diff_view::{self, RenderedDiff, SearchTarget};
 
 /// File-level choice state for non-textual conflicts (§48-51).
@@ -98,6 +99,8 @@ impl ConflictSession {
 
 /// User actions of the solver, handled by the main window.
 pub struct Callbacks {
+    /// Open the current conflicted working-tree file externally.
+    pub open_editor: Box<dyn Fn(PathBuf)>,
     /// A block received its resolution (also from Result editing, §25).
     pub choose: Box<dyn Fn(usize, ConflictResolution)>,
     /// A block is reset to unresolved (§28).
@@ -129,7 +132,7 @@ pub fn render(
     let wide = window_width >= WIDE_LAYOUT_MIN_WIDTH;
     let root = GtkBox::new(Orientation::Vertical, 12);
     diff_view::set_margins(&root, 12);
-    root.append(&header(session));
+    root.append(&header(session, callbacks));
 
     let targets = match &session.load.presentation {
         ConflictPresentation::TextBlocks(file) => {
@@ -150,7 +153,7 @@ pub fn render(
 }
 
 /// Header: path and operation context (§33).
-fn header(session: &ConflictSession) -> gtk4::Widget {
+fn header(session: &ConflictSession, callbacks: &Rc<Callbacks>) -> gtk4::Widget {
     let root = GtkBox::new(Orientation::Vertical, 2);
     let path = Label::new(Some(&session.path.display().to_string()));
     path.add_css_class("heading");
@@ -167,6 +170,17 @@ fn header(session: &ConflictSession) -> gtk4::Widget {
     root.append(&hint_label(
         "Nothing is written until the final apply. Manual edits outside Gitilante are never overwritten.",
     ));
+    let relative_path = session.path.clone();
+    let callbacks = callbacks.clone();
+    clipboard::context_menu(
+        &root,
+        vec![(
+            "Open in Editor",
+            Box::new(move || {
+                (callbacks.open_editor)(relative_path.clone());
+            }),
+        )],
+    );
     root.upcast()
 }
 
