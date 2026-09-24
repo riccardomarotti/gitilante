@@ -26,7 +26,9 @@ use crate::model::refs::{CommitRef, HeadRef};
 use crate::model::status::{Status, StatusEntry};
 use crate::search::SearchQuery;
 use crate::search::SearchScope;
-use crate::search::result::{ChangeSearchResult, MatchRange, SearchResult};
+use crate::search::result::{
+    ChangeSearchResult, HistoryChangeSearchResult, MatchRange, SearchResult,
+};
 use crate::ui::worker::Worker;
 use crate::ui::{
     DiffSide, HunkTarget, Selection, changes, diff_view, history, search, search_dialog, short_path,
@@ -77,6 +79,8 @@ struct State {
     file_preview: Option<(PathBuf, Result<Vec<u8>, String>)>,
     /// Match ranges to flash once the preview is rendered (section 22).
     preview_flash: Option<Vec<MatchRange>>,
+    /// Query to flash in the commit diff once loaded (section 30).
+    commit_flash: Option<SearchQuery>,
     /// Bumped on every selection change; stale commit diffs are dropped.
     commit_diff_generation: u64,
     /// Hunk that has keyboard focus, target of the contextual shortcuts.
@@ -233,9 +237,9 @@ impl Inner {
                 }),
                 activate: {
                     let weak = self_weak.clone();
-                    Box::new(move |result| {
+                    Box::new(move |result, query| {
                         if let Some(inner) = weak.upgrade() {
-                            inner.activate_search_result(result);
+                            inner.activate_search_result(result, query);
                         }
                     })
                 },
@@ -564,6 +568,9 @@ impl Inner {
             }
         }
         self.render_diff();
+        // GITILANTE_SEARCH_SPEC.md section 30: land on the first match of a
+        // History Changes result.
+        self.flash_commit_matches();
     }
 
     // --- selection and rendering -----------------------------------------
@@ -658,6 +665,7 @@ impl Inner {
                 // The providers work on data already loaded or on the worker
                 // thread (GITILANTE_SEARCH_SPEC.md sections 52-53).
                 let mut results = Vec::new();
+                let mut error = None;
                 if matches!(query.scope, SearchScope::All | SearchScope::Changes) {
                     results.extend(crate::search::changes::search(&query, &worktree, &staged));
                 }
@@ -674,13 +682,25 @@ impl Inner {
                     let refs = repo.commit_refs().unwrap_or_default();
                     results.extend(crate::search::history::search(&query, &repo, &refs));
                 }
-                results
+                // History Changes never runs in All (section 28).
+                if query.scope == SearchScope::HistoryChanges {
+                    match crate::search::history_changes::search(&query, &repo) {
+                        Ok(found) => results.extend(found),
+                        Err(message) => error = Some(message),
+                    }
+                }
+                (results, error)
             },
-            move |results| {
+            move |(results, error)| {
                 if let Some(inner) = weak.upgrade() {
                     // A stale search never overwrites newer ones (section 35).
                     if inner.search_generation.get() == generation {
                         inner.search_dialog.show_results(results);
+                        if let Some(message) = error {
+                            // A failing provider never hides the others
+                            // (GITILANTE_SEARCH_SPEC.md sections 37-38).
+                            inner.search_dialog.show_error(&message);
+                        }
                     }
                 }
             },
@@ -688,7 +708,7 @@ impl Inner {
     }
 
     /// Navigates to an activated search result (GITILANTE_SEARCH_SPEC.md §12).
-    fn activate_search_result(&self, result: SearchResult) {
+    fn activate_search_result(&self, result: SearchResult, query: SearchQuery) {
         match result {
             SearchResult::Change(change) => self.navigate_to_change(&change),
             SearchResult::File(file) => self.navigate_to_file(&file.path, None, &[]),
@@ -698,8 +718,86 @@ impl Inner {
                 &content.match_ranges,
             ),
             SearchResult::Commit(commit) => self.navigate_to_commit(&commit.oid),
-            // The other providers arrive with their phases.
-            _ => {}
+            SearchResult::HistoryChange(change) => self.navigate_to_history_change(&change, &query),
+        }
+    }
+
+    /// Navigates to a History Changes result (GITILANTE_SEARCH_SPEC.md §30):
+    /// select the commit, then flash the first match on its changed lines.
+    fn navigate_to_history_change(&self, result: &HistoryChangeSearchResult, query: &SearchQuery) {
+        self.search_dialog.close();
+        {
+            let mut state = self.state.borrow_mut();
+            state.commit_flash = Some(query.clone());
+        }
+        self.select(Selection::Commit(result.oid.clone()));
+    }
+
+    /// Flashes the first match of the pending query on the added/removed lines
+    /// of the freshly rendered commit diff (GITILANTE_SEARCH_SPEC.md §30).
+    fn flash_commit_matches(&self) {
+        let (query, diff, targets) = {
+            let mut state = self.state.borrow_mut();
+            let Some(query) = state.commit_flash.take() else {
+                return;
+            };
+            let Some((_, diff)) = state.commit_diff.clone() else {
+                return;
+            };
+            (query, diff, state.render_targets.clone())
+        };
+        let case_sensitive = query.is_case_sensitive();
+        let mut hunk_index = 0;
+        for file in &diff.files {
+            for hunk in &file.hunks {
+                for (line_index, line) in hunk.lines.iter().enumerate() {
+                    if !matches!(
+                        line.kind,
+                        crate::model::diff::DiffLineKind::Addition
+                            | crate::model::diff::DiffLineKind::Deletion
+                    ) {
+                        continue;
+                    }
+                    let text = line.text();
+                    let found =
+                        crate::search::matcher::find_matches(&text, &query.text, case_sensitive);
+                    if found.is_empty() {
+                        continue;
+                    }
+                    // Flash this match and stop: Ctrl+F walks the rest.
+                    let Some(target) = targets.get(hunk_index) else {
+                        return;
+                    };
+                    let flash_tag = search::flash_tag(&target.buffer);
+                    for (start, end) in found {
+                        let (Some(from), Some(to)) = (
+                            target
+                                .buffer
+                                .iter_at_line_offset(line_index as i32, start as i32),
+                            target
+                                .buffer
+                                .iter_at_line_offset(line_index as i32, end as i32),
+                        ) else {
+                            continue;
+                        };
+                        target.buffer.apply_tag(&flash_tag, &from, &to);
+                    }
+                    if let Some(iter) = target.buffer.iter_at_line_offset(line_index as i32, 0) {
+                        search::reveal_iter(&self.diff_scroll, target, &iter);
+                    }
+                    let buffer = target.buffer.clone();
+                    gtk4::glib::timeout_add_local_once(
+                        std::time::Duration::from_millis(1400),
+                        move || {
+                            let start = buffer.start_iter();
+                            let end = buffer.end_iter();
+                            buffer.remove_tag(&flash_tag, &start, &end);
+                        },
+                    );
+                    return;
+                }
+                hunk_index += 1;
+            }
         }
     }
 

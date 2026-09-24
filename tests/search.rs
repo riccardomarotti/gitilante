@@ -139,3 +139,57 @@ fn finds_commits_by_ref_name() {
     };
     assert!(commit.refs.iter().any(|name| name == "feature/parser"));
 }
+
+#[test]
+fn history_changes_follows_pickaxe_semantics() {
+    // GITILANTE_SEARCH_SPEC.md section 67: -S finds the commits whose number of
+    // occurrences changes.
+    let repo = TestRepo::new();
+    repo.write("config.rs", b"DEFAULT_TIMEOUT = 30\n");
+    repo.commit_all("add default timeout");
+    repo.write("other.txt", b"unrelated\n");
+    repo.commit_all("touch something");
+    repo.write("config.rs", b"// gone\n");
+    repo.commit_all("remove default timeout");
+
+    let backend = repo.repository();
+    let results =
+        gitilante::search::history_changes::search(&query("DEFAULT_TIMEOUT"), &backend).unwrap();
+    let subjects: Vec<&str> = results
+        .iter()
+        .map(|result| match result {
+            SearchResult::HistoryChange(change) => change.subject.as_str(),
+            _ => panic!("expected a history change result"),
+        })
+        .collect();
+    assert_eq!(
+        subjects,
+        vec!["remove default timeout", "add default timeout"]
+    );
+}
+
+#[test]
+fn history_changes_regex_mode_uses_log_g() {
+    // GITILANTE_SEARCH_SPEC.md section 68.
+    let repo = TestRepo::new();
+    repo.write("v.txt", b"value = 42\n");
+    repo.commit_all("add value");
+    repo.write("v.txt", b"value = 43\n");
+    repo.commit_all("change value");
+
+    let backend = repo.repository();
+    let regex_query = SearchQuery {
+        text: "value = 4[23]".to_owned(),
+        regex: true,
+        ..SearchQuery::default()
+    };
+    let results = gitilante::search::history_changes::search(&regex_query, &backend).unwrap();
+    assert_eq!(results.len(), 2, "both commits: {results:#?}");
+
+    let invalid = SearchQuery {
+        text: "[invalid(".to_owned(),
+        regex: true,
+        ..SearchQuery::default()
+    };
+    assert!(gitilante::search::history_changes::search(&invalid, &backend).is_err());
+}

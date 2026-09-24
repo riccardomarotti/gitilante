@@ -9,6 +9,7 @@ pub mod changes;
 pub mod contents;
 pub mod files;
 pub mod history;
+pub mod history_changes;
 pub mod matcher;
 pub mod query;
 pub mod result;

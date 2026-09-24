@@ -29,8 +29,8 @@ const SEARCH_DEBOUNCE: Duration = Duration::from_millis(200);
 pub struct Callbacks {
     /// Run the query (on the worker thread, section 52).
     pub search: Box<dyn Fn(SearchQuery)>,
-    /// A result was activated (navigation, section 12).
-    pub activate: Box<dyn Fn(SearchResult)>,
+    /// A result was activated with its query (navigation, sections 12 and 30).
+    pub activate: Box<dyn Fn(SearchResult, SearchQuery)>,
     /// Told when the dialog opens/closes, to suspend the single-key shortcuts
     /// (section 51).
     pub on_open: Box<dyn Fn(bool)>,
@@ -82,16 +82,19 @@ impl SearchDialog {
         let scope_files = ToggleButton::with_label("Files");
         let scope_contents = ToggleButton::with_label("Contents");
         let scope_history = ToggleButton::with_label("History");
+        let scope_history_changes = ToggleButton::with_label("History Changes");
         scope_changes.set_group(Some(&scope_all));
         scope_files.set_group(Some(&scope_all));
         scope_contents.set_group(Some(&scope_all));
         scope_history.set_group(Some(&scope_all));
+        scope_history_changes.set_group(Some(&scope_all));
         scope_all.set_active(true);
         scopes.append(&scope_all);
         scopes.append(&scope_changes);
         scopes.append(&scope_files);
         scopes.append(&scope_contents);
         scopes.append(&scope_history);
+        scopes.append(&scope_history_changes);
         content.append(&scopes);
 
         // Added/Removed filter, shown only for the Changes scope (section 10).
@@ -205,6 +208,18 @@ impl SearchDialog {
             scope_history.connect_toggled(move |button| {
                 if button.is_active() {
                     shared.query.borrow_mut().scope = SearchScope::History;
+                    update_filter_visibility(&shared);
+                    run_search(&shared);
+                }
+            });
+        }
+        {
+            // History Changes is explicit-only: it never runs in All
+            // (GITILANTE_SEARCH_SPEC.md section 28).
+            let shared = shared.clone();
+            scope_history_changes.connect_toggled(move |button| {
+                if button.is_active() {
+                    shared.query.borrow_mut().scope = SearchScope::HistoryChanges;
                     update_filter_visibility(&shared);
                     run_search(&shared);
                 }
@@ -449,7 +464,7 @@ fn activate_row(shared: &Rc<Shared>, index: i32) {
     let Some(Some(result)) = shared.rows.borrow().get(index as usize).cloned() else {
         return;
     };
-    (shared.callbacks.activate)(result);
+    (shared.callbacks.activate)(result, shared.query.borrow().clone());
 }
 
 /// A non-selectable group header row (GITILANTE_SEARCH_SPEC.md section 31).
