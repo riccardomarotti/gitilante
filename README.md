@@ -1,6 +1,6 @@
 # Gitilante
 
-![demo](/uploads/d6ac5798d327cbb6c4877ce2565e40c8/demo.gif)
+![demo](https://gitlab.com/-/project/86793605/uploads/d6ac5798d327cbb6c4877ce2565e40c8/demo.gif)
 
 A lightweight open source Git GUI, focused on the operations that are more
 convenient in a graphical interface than in a terminal: reviewing the current
