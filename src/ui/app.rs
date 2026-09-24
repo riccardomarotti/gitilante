@@ -36,6 +36,7 @@ pub fn run(repo: Repository) -> i32 {
     let app = adw::Application::builder().application_id(APP_ID).build();
 
     app.set_accels_for_action("win.refresh", &["<Primary>r"]);
+    app.set_accels_for_action("win.search", &["<Primary>f"]);
 
     // Ref badge styling for the History graph (BRANCH.md section 41).
     app.connect_startup(|_| {

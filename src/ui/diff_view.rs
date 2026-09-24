@@ -43,14 +43,40 @@ pub struct Callbacks {
     pub discard_file: Box<dyn Fn(PathBuf)>,
 }
 
+/// One piece of searchable rendered text: the buffer of a hunk body holds
+/// clean source text only (no headers, numbers or gutter) and the view hosts it
+/// (GITILANTE_SEARCH_SPEC.md section 3).
+#[derive(Clone)]
+pub struct SearchTarget {
+    pub buffer: TextBuffer,
+    pub view: TextView,
+}
+
+/// A rendered diff: its widget and its searchable text (one per hunk body).
+pub struct RenderedDiff {
+    pub widget: gtk4::Widget,
+    pub targets: Vec<SearchTarget>,
+}
+
+impl RenderedDiff {
+    /// A rendered widget without searchable text (placeholders, metadata).
+    pub fn plain(widget: gtk4::Widget) -> Self {
+        Self {
+            widget,
+            targets: Vec::new(),
+        }
+    }
+}
+
 /// Renders the diff of `file` with the per-hunk and per-file actions of `side`.
 pub fn render(
     file: &FileDiff,
     side: DiffSide,
     highlighter: &Highlighter,
     callbacks: &Rc<Callbacks>,
-) -> gtk4::Widget {
+) -> RenderedDiff {
     let root = GtkBox::new(Orientation::Vertical, 12);
+    let mut targets = Vec::new();
     set_margins(&root, 12);
     root.append(&file_header(file, side, callbacks));
 
@@ -73,21 +99,20 @@ pub fn render(
         }
     } else {
         for hunk in &file.hunks {
-            root.append(&hunk_view(
-                file,
-                hunk,
-                side,
-                language.as_ref(),
-                highlighter,
-                callbacks,
-            ));
+            let (widget, target) =
+                hunk_view(file, hunk, side, language.as_ref(), highlighter, callbacks);
+            root.append(&widget);
+            targets.push(target);
         }
     }
-    root.upcast()
+    RenderedDiff {
+        widget: root.upcast(),
+        targets,
+    }
 }
 
 /// Renders the placeholder shown for an untracked file (SPEC section 15).
-pub fn render_untracked(path: &std::path::Path, callbacks: &Rc<Callbacks>) -> gtk4::Widget {
+pub fn render_untracked(path: &std::path::Path, callbacks: &Rc<Callbacks>) -> RenderedDiff {
     let root = GtkBox::new(Orientation::Vertical, 12);
     set_margins(&root, 12);
 
@@ -108,7 +133,7 @@ pub fn render_untracked(path: &std::path::Path, callbacks: &Rc<Callbacks>) -> gt
     root.append(&placeholder(
         "Untracked file: stage it to work on its changes",
     ));
-    root.upcast()
+    RenderedDiff::plain(root.upcast())
 }
 
 /// Renders a centered-left informational label.
@@ -171,7 +196,7 @@ fn hunk_view(
     language: Option<&Language>,
     highlighter: &Highlighter,
     callbacks: &Rc<Callbacks>,
-) -> gtk4::Widget {
+) -> (gtk4::Widget, SearchTarget) {
     let block = GtkBox::new(Orientation::Vertical, 4);
     let target = HunkTarget {
         file: file.clone(),
@@ -254,10 +279,10 @@ fn hunk_view(
     }
     block.append(&header);
 
-    let body = hunk_body(hunk, language, highlighter);
+    let (body, search_target) = hunk_body(hunk, language, highlighter);
     track_focus(&body, &target, callbacks);
     block.append(&body);
-    block.upcast()
+    (block.upcast(), search_target)
 }
 
 /// Appends an action button that reports its hunk when focused or clicked.
@@ -303,7 +328,11 @@ enum Side {
 /// foreground, the line tags the base background and the intraline tags the
 /// strong background on top. Styles come from the two logical streams of the
 /// hunk, never from the mixed text (COLORS.md sections 11 and 12).
-fn hunk_body(hunk: &Hunk, language: Option<&Language>, highlighter: &Highlighter) -> gtk4::Widget {
+fn hunk_body(
+    hunk: &Hunk,
+    language: Option<&Language>,
+    highlighter: &Highlighter,
+) -> (gtk4::Widget, SearchTarget) {
     // Build the old and new source streams and remember, for every visible
     // line, which stream styles it (context lines are shared, section 20).
     let (mut old_lines, mut new_lines) = (Vec::<String>::new(), Vec::<String>::new());
@@ -443,7 +472,8 @@ fn hunk_body(hunk: &Hunk, language: Option<&Language>, highlighter: &Highlighter
     box_.add_css_class("frame");
     box_.append(&gutter_view);
     box_.append(&body);
-    box_.upcast()
+    let search_target = SearchTarget { buffer, view: body };
+    (box_.upcast(), search_target)
 }
 
 /// Applies `tags` to a character range of one buffer line.

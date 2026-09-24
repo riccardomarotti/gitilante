@@ -6,6 +6,7 @@ pub mod diff_view;
 pub mod graph_gutter;
 pub mod history;
 pub mod main_window;
+pub mod search;
 pub mod worker;
 
 use std::path::{Path, PathBuf};

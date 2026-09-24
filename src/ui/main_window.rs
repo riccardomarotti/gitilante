@@ -25,7 +25,7 @@ use crate::model::diff::{Diff, FileDiff, Hunk};
 use crate::model::refs::{CommitRef, HeadRef};
 use crate::model::status::{Status, StatusEntry};
 use crate::ui::worker::Worker;
-use crate::ui::{DiffSide, HunkTarget, Selection, changes, diff_view, history, short_path};
+use crate::ui::{DiffSide, HunkTarget, Selection, changes, diff_view, history, search, short_path};
 
 /// Commits per history block (SPEC section 16).
 const HISTORY_PAGE: usize = 200;
@@ -88,6 +88,8 @@ struct Inner {
     spinner: gtk4::Spinner,
     changes: changes::ChangesView,
     history_view: history::HistoryView,
+    /// Ctrl+F search bar over the diff panel (GITILANTE_SEARCH_SPEC.md §3).
+    search_bar: search::SearchBar,
     diff_box: GtkBox,
     diff_scroll: ScrolledWindow,
     /// Sidebar scroll, anchored across History rebuilds.
@@ -191,9 +193,16 @@ impl Inner {
         let diff_box = GtkBox::new(Orientation::Vertical, 0);
         diff_scroll.set_child(Some(&diff_box));
 
+        // The search bar sits above the diff panel
+        // (GITILANTE_SEARCH_SPEC.md section 3).
+        let search_bar = search::SearchBar::new(diff_scroll.clone());
+        let diff_panel = GtkBox::new(Orientation::Vertical, 0);
+        diff_panel.append(search_bar.widget());
+        diff_panel.append(&diff_scroll);
+
         let paned = Paned::new(Orientation::Horizontal);
         paned.set_start_child(Some(&sidebar_scroll));
-        paned.set_end_child(Some(&diff_scroll));
+        paned.set_end_child(Some(&diff_panel));
         paned.set_position(340);
         paned.set_resize_start_child(false);
         paned.set_shrink_start_child(false);
@@ -225,6 +234,19 @@ impl Inner {
             });
         }
         window.add_action(&refresh_action);
+
+        // Ctrl+F: search in the current view
+        // (GITILANTE_SEARCH_SPEC.md sections 2-3).
+        let search_action = gio::SimpleAction::new("search", None);
+        {
+            let weak = self_weak.clone();
+            search_action.connect_activate(move |_, _| {
+                if let Some(inner) = weak.upgrade() {
+                    inner.search_bar.open();
+                }
+            });
+        }
+        window.add_action(&search_action);
 
         // Contextual hunk shortcuts, acting on the focused hunk (SPEC §30).
         for (name, activate) in [
@@ -281,6 +303,7 @@ impl Inner {
             spinner,
             changes,
             history_view,
+            search_bar,
             diff_box,
             diff_scroll,
             sidebar_adjustment: sidebar_scroll.vadjustment(),
@@ -560,54 +583,73 @@ impl Inner {
             self.diff_box.remove(&child);
         }
 
-        let widget = match &state.selection {
-            None => diff_view::placeholder("Select a file to see its diff"),
+        let rendered = match &state.selection {
+            None => diff_view::RenderedDiff::plain(diff_view::placeholder(
+                "Select a file to see its diff",
+            )),
             Some(Selection::Untracked(path)) => {
                 diff_view::render_untracked(path, &self.diff_callbacks())
             }
             Some(Selection::Staged(path)) => match state.data.as_ref() {
                 Some(data) => self.render_file_diff(&data.staged, path, DiffSide::Staged),
-                None => diff_view::placeholder("Loading…"),
+                None => diff_view::RenderedDiff::plain(diff_view::placeholder("Loading…")),
             },
             Some(Selection::Unstaged(path)) => match state.data.as_ref() {
                 Some(data) => self.render_file_diff(&data.worktree, path, DiffSide::Unstaged),
-                None => diff_view::placeholder("Loading…"),
+                None => diff_view::RenderedDiff::plain(diff_view::placeholder("Loading…")),
             },
             Some(Selection::Conflicted(path)) => match state.data.as_ref() {
                 Some(data) => self.render_file_diff(&data.worktree, path, DiffSide::Conflicted),
-                None => diff_view::placeholder("Loading…"),
+                None => diff_view::RenderedDiff::plain(diff_view::placeholder("Loading…")),
             },
             Some(Selection::Commit(oid)) => match &state.commit_diff {
                 Some((cached, diff)) if cached == oid => self.render_commit_diff(diff),
-                _ => diff_view::placeholder("Loading diff…"),
+                _ => diff_view::RenderedDiff::plain(diff_view::placeholder("Loading diff…")),
             },
         };
-        self.diff_box.append(&widget);
+        self.diff_box.append(&rendered.widget);
+        // Ctrl+F searches the freshly rendered text (GITILANTE_SEARCH_SPEC.md §3).
+        self.search_bar.set_targets(rendered.targets);
         self.diff_scroll.vadjustment().set_value(0.0);
     }
 
-    fn render_file_diff(&self, diff: &Diff, path: &Path, side: DiffSide) -> gtk4::Widget {
+    fn render_file_diff(
+        &self,
+        diff: &Diff,
+        path: &Path,
+        side: DiffSide,
+    ) -> diff_view::RenderedDiff {
         match find_file(diff, path) {
             Some(file) => diff_view::render(file, side, &self.highlighter, &self.diff_callbacks()),
-            None => diff_view::placeholder("No diff available for this file"),
+            None => diff_view::RenderedDiff::plain(diff_view::placeholder(
+                "No diff available for this file",
+            )),
         }
     }
 
     /// Renders every file of a commit diff with the same renderer (SPEC §17).
-    fn render_commit_diff(&self, diff: &Diff) -> gtk4::Widget {
+    fn render_commit_diff(&self, diff: &Diff) -> diff_view::RenderedDiff {
         if diff.files.is_empty() {
-            return diff_view::placeholder("No changes in this commit");
+            return diff_view::RenderedDiff::plain(diff_view::placeholder(
+                "No changes in this commit",
+            ));
         }
         let box_ = GtkBox::new(Orientation::Vertical, 24);
+        let mut targets = Vec::new();
         for file in &diff.files {
-            box_.append(&diff_view::render(
+            let rendered = diff_view::render(
                 file,
                 DiffSide::History,
                 &self.highlighter,
                 &self.diff_callbacks(),
-            ));
+            );
+            box_.append(&rendered.widget);
+            targets.extend(rendered.targets);
         }
-        box_.upcast()
+        diff_view::RenderedDiff {
+            widget: box_.upcast(),
+            targets,
+        }
     }
 
     fn diff_callbacks(&self) -> Rc<diff_view::Callbacks> {
