@@ -277,7 +277,8 @@ pub fn commits_by_oid(repo: &Repository, oids: &[String]) -> Result<Vec<Commit>>
         format!("--format={LOG_FORMAT}"),
         format!("--max-count={}", oids.len()),
         "--no-walk=sorted".to_owned(),
-        "--".to_owned(),
+        // `--` introduces pathspecs, not revisions: use the option delimiter.
+        "--end-of-options".to_owned(),
     ];
     args.extend(oids.iter().cloned());
 

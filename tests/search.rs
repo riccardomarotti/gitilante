@@ -120,6 +120,17 @@ fn finds_commits_by_subject_author_and_object_name() {
         panic!("expected a commit result");
     };
     assert_eq!(commit.oid, oid);
+
+    // An older commit must resolve too: passing `-- <oid>` to git log would
+    // interpret the object name as a path and silently return HEAD instead.
+    repo.write("later.txt", b"later\n");
+    repo.commit_all("Later commit");
+    let results = gitilante::search::history::search(&query(&oid[..7]), &backend, &refs);
+    assert_eq!(results.len(), 1, "older commit by prefix: {results:#?}");
+    let SearchResult::Commit(commit) = &results[0] else {
+        panic!("expected a commit result");
+    };
+    assert_eq!(commit.oid, oid);
 }
 
 #[test]
