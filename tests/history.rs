@@ -182,7 +182,7 @@ fn commit_diff_of_a_root_commit_shows_added_files() {
 }
 
 #[test]
-fn commit_diff_of_a_merge_commit_is_empty() {
+fn commit_diff_of_a_merge_commit_shows_its_changes() {
     let repo = TestRepo::new();
     repo.write("base.txt", b"base\n");
     repo.commit_all("base");
@@ -195,10 +195,16 @@ fn commit_diff_of_a_merge_commit_is_empty() {
     repo.git(&["merge", "-q", "--no-ff", "-m", "merge side", "side"]);
     let oid = repo.git(&["rev-parse", "HEAD"]).trim().to_owned();
 
-    // `git show` without --m/--c shows no diff for merges.
+    // A merge is reviewed as the changes it brings into its first parent:
+    // the combined diff of a clean merge would be empty.
     let backend = repo.repository();
     let diff = backend.commit_diff(&oid).expect("commit diff");
-    assert!(diff.files.is_empty());
+    assert_eq!(diff.files.len(), 1);
+    assert_eq!(
+        diff.files[0].path(),
+        Some(std::path::Path::new("side.txt")),
+        "the merge only brings side.txt into main"
+    );
 }
 
 #[test]

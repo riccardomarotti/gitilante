@@ -62,24 +62,37 @@ pub fn history(repo: &Repository, skip: usize, max_count: usize) -> Result<Vec<C
 
 /// Diff of a single commit (`git show --format= --patch`).
 ///
-/// The result uses the same [`Diff`] model and renderer as the working tree
-/// and staged diffs (SPEC section 17).
+/// A merge commit is reviewed as the changes it brings into its first parent,
+/// the way most Git GUIs do: the combined diff of a clean merge is empty.
 pub fn commit_diff(repo: &Repository, oid: &str) -> Result<Diff> {
-    let mut args = vec![
-        "-c".to_owned(),
-        "core.quotePath=true".to_owned(),
-        "show".to_owned(),
-        "--format=".to_owned(),
-        "--patch".to_owned(),
-    ];
-    args.extend(STABLE_DIFF_FLAGS.iter().map(|flag| (*flag).to_owned()));
-    args.push(oid.to_owned());
+    let mut args = vec!["-c".to_owned(), "core.quotePath=true".to_owned()];
+    if parent_count(repo, oid)? > 1 {
+        args.push("diff".to_owned());
+        args.extend(STABLE_DIFF_FLAGS.iter().map(|flag| (*flag).to_owned()));
+        args.push(format!("{oid}^1"));
+        args.push(oid.to_owned());
+    } else {
+        args.push("show".to_owned());
+        args.push("--format=".to_owned());
+        args.push("--patch".to_owned());
+        args.extend(STABLE_DIFF_FLAGS.iter().map(|flag| (*flag).to_owned()));
+        args.push(oid.to_owned());
+    }
 
     let output = command::run(repo.root(), &args)?;
     crate::git::diff::parse(&output.stdout).map_err(|detail| Error::MalformedOutput {
         command: "show".to_owned(),
         detail,
     })
+}
+
+/// Number of parents of a commit (zero for a root commit).
+fn parent_count(repo: &Repository, oid: &str) -> Result<usize> {
+    let output = command::run(repo.root(), &["rev-list", "--parents", "-n", "1", oid])?;
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .split_whitespace()
+        .count()
+        .saturating_sub(1))
 }
 
 /// Runs `git log` with `filters` over the same revisions as [`history`]
