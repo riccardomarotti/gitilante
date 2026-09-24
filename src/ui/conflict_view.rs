@@ -188,7 +188,7 @@ fn counter_text(total: usize, resolved: usize) -> String {
 /// Minimum window width for the side-by-side layout (§32).
 const WIDE_LAYOUT_MIN_WIDTH: i32 = 1100;
 
-/// All conflict blocks with the counter, navigation and final apply (§33-38).
+/// All conflict blocks with the counter and the final apply (§33-38).
 fn blocks_view(
     session: &ConflictSession,
     file: &crate::conflict::ConflictFile,
@@ -199,11 +199,6 @@ fn blocks_view(
     let root = GtkBox::new(Orientation::Vertical, 12);
     let mut targets = Vec::new();
     let total = file.conflict_count();
-
-    // Navigation state shared between the header row and the blocks (§34).
-    let block_targets: Rc<RefCell<Vec<(Button, TextView)>>> = Rc::new(RefCell::new(Vec::new()));
-    let current_block: Rc<Cell<usize>> = Rc::new(Cell::new(0));
-    root.append(&navigation_row(&block_targets, &current_block));
 
     let resolved_flags: Rc<RefCell<Vec<bool>>> = Rc::new(RefCell::new(vec![false; total]));
     let counter = Label::new(Some(&counter_text(total, session.resolved_units())));
@@ -217,7 +212,7 @@ fn blocks_view(
     apply_button.set_sensitive(session.is_complete());
 
     for (index, block) in file.conflicts().enumerate() {
-        let (widget, new_targets, status_button, scroll_target) = block_view(
+        let (widget, new_targets) = block_view(
             index,
             block,
             session,
@@ -229,9 +224,6 @@ fn blocks_view(
             &apply_button,
             wide,
         );
-        block_targets
-            .borrow_mut()
-            .push((status_button, scroll_target));
         root.append(&widget);
         targets.extend(new_targets);
     }
@@ -243,43 +235,6 @@ fn blocks_view(
         "Apply resolution writes the file and stages it. Continue the Git operation from the command line.",
     ));
     (root.upcast(), targets)
-}
-
-/// Previous/next conflict navigation (§34).
-/// Previous/next conflict navigation (§34).
-///
-/// Each click focuses the target block and scrolls it into view.
-fn navigation_row(
-    block_targets: &Rc<RefCell<Vec<(Button, TextView)>>>,
-    current: &Rc<Cell<usize>>,
-) -> gtk4::Widget {
-    let row = GtkBox::new(Orientation::Horizontal, 8);
-    for (label, step) in [("◀ Previous conflict", -1i32), ("Next conflict ▶", 1i32)] {
-        let button = Button::with_label(label);
-        let block_targets = block_targets.clone();
-        let current = current.clone();
-        button.connect_clicked(move |_| {
-            let targets = block_targets.borrow();
-            let total = targets.len();
-            if total == 0 {
-                return;
-            }
-            let index = (current.get() as i32 + step).rem_euclid(total as i32) as usize;
-            current.set(index);
-            if let Some((status_button, scroll_target)) = targets.get(index) {
-                status_button.grab_focus();
-                // Explicit scroll: focus alone does not reliably move the view.
-                let buffer = scroll_target.buffer();
-                let mut start = buffer.start_iter();
-                scroll_target.scroll_to_iter(&mut start, 0.1, true, 0.0, 0.05);
-            }
-        });
-        row.append(&button);
-    }
-    row.append(&hint_label(
-        "Jumps between the conflict blocks of this file.",
-    ));
-    row.upcast()
 }
 
 /// One conflict block: sources, actions, base and the editable Result (§25-36).
@@ -295,7 +250,7 @@ fn block_view(
     counter: &Label,
     apply_button: &Button,
     wide: bool,
-) -> (gtk4::Widget, Vec<SearchTarget>, Button, TextView) {
+) -> (gtk4::Widget, Vec<SearchTarget>) {
     let root = GtkBox::new(Orientation::Vertical, 6);
     let mut targets = Vec::new();
     let labels = context_labels(&session.load.context);
@@ -470,7 +425,7 @@ fn block_view(
     targets.push(result_target);
 
     root.append(&body);
-    (root.upcast(), targets, status_button, result_view)
+    (root.upcast(), targets)
 }
 
 /// Builds the closure updating progress, apply sensitivity and the block state.

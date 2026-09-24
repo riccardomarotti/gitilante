@@ -109,6 +109,10 @@ struct Inner {
     folds: RefCell<folding::FoldStateStore>,
     /// Disclosure to focus after a folding toggle (section 26).
     pending_focus: Cell<Option<folding::FoldFocus>>,
+    /// Menu button whose model swaps between diff and conflict folding (§68).
+    fold_button: gtk4::MenuButton,
+    /// Last menu context; avoid replacing an open menu on every render.
+    conflict_fold_menu_active: Cell<bool>,
     /// Query whose hidden matches were revealed last (sections 30-32).
     last_reveal_query: RefCell<Option<String>>,
     self_weak: Weak<Inner>,
@@ -365,6 +369,21 @@ impl Inner {
             window.add_action(&fold_action);
         }
 
+        // Conflict folding actions (conflict solver §35).
+        for (name, collapse) in [
+            ("fold-collapse-conflicts", true),
+            ("fold-expand-conflicts", false),
+        ] {
+            let fold_action = gio::SimpleAction::new(name, None);
+            let weak = self_weak.clone();
+            fold_action.connect_activate(move |_, _| {
+                if let Some(inner) = weak.upgrade() {
+                    inner.fold_all_conflicts(collapse);
+                }
+            });
+            window.add_action(&fold_action);
+        }
+
         // Contextual hunk shortcuts, acting on the focused hunk (SPEC §30).
         for (name, activate) in [
             ("stage-hunk", Inner::shortcut_stage_hunk as fn(&Inner)),
@@ -415,6 +434,8 @@ impl Inner {
             highlighter: crate::syntax::Highlighter::new(),
             folds: RefCell::new(folding::FoldStateStore::default()),
             pending_focus: Cell::new(None),
+            fold_button,
+            conflict_fold_menu_active: Cell::new(false),
             last_reveal_query: RefCell::new(None),
             self_weak,
             window,
@@ -733,6 +754,43 @@ impl Inner {
     }
 
     // --- conflict solver (docs/GITILANTE_CONFLICT_SOLVER_SPEC.md) -------
+
+    /// Swaps the folding menu between the diff and the conflict solver (§68).
+    fn update_fold_menu(&self) {
+        let conflict = matches!(
+            self.state.borrow().selection,
+            Some(Selection::Conflicted(_))
+        );
+        if self.conflict_fold_menu_active.get() == conflict {
+            return;
+        }
+        self.conflict_fold_menu_active.set(conflict);
+        let menu = gio::Menu::new();
+        if conflict {
+            menu.append(
+                Some("Collapse all conflicts"),
+                Some("win.fold-collapse-conflicts"),
+            );
+            menu.append(
+                Some("Expand all conflicts"),
+                Some("win.fold-expand-conflicts"),
+            );
+            self.fold_button.set_tooltip_text(Some("Conflict folding"));
+        } else {
+            menu.append(Some("Collapse all files"), Some("win.fold-collapse-files"));
+            menu.append(Some("Expand all files"), Some("win.fold-expand-files"));
+            menu.append(Some("Collapse all hunks"), Some("win.fold-collapse-hunks"));
+            menu.append(Some("Expand all hunks"), Some("win.fold-expand-hunks"));
+            self.fold_button.set_tooltip_text(Some("Diff folding"));
+        }
+        self.fold_button.set_menu_model(Some(&menu));
+    }
+
+    /// Collapses or expands every conflict block (§35).
+    fn fold_all_conflicts(&self, collapse: bool) {
+        self.with_current_session(|session| session.collapsed.fill(collapse));
+        self.render_diff();
+    }
 
     /// Loads one conflict into a solver session (§58).
     fn load_conflict(&self, generation: u64, path: PathBuf) {
@@ -1491,6 +1549,7 @@ impl Inner {
 
     /// Rebuilds the diff pane for the current selection.
     fn render_diff(&self) {
+        self.update_fold_menu();
         let mut state = self.state.borrow_mut();
         let focus = self.pending_focus.take();
         // Focus tracking starts over with the new widgets.
