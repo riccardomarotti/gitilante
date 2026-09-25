@@ -102,6 +102,31 @@ pub fn detach_context_menu(widget: &impl IsA<gtk4::Widget>) {
 /// Each action owns the data of that row; the current selection is irrelevant.
 pub type MenuAction = (&'static str, Box<dyn Fn()>);
 
+/// GDK event coordinates are relative to the window surface; the popover's
+/// pointing rectangle must instead be relative to its anchor widget.
+fn point_at_event(popover: &Popover, anchor: &gtk4::Widget, event: &gdk::Event) {
+    let Some((x, y)) = event.position() else {
+        return;
+    };
+    let Some(root) = anchor.root().and_then(|root| {
+        root.upcast::<gtk4::glib::Object>()
+            .downcast::<gtk4::Widget>()
+            .ok()
+    }) else {
+        return;
+    };
+    let point = gtk4::graphene::Point::new(x as f32, y as f32);
+    let Some(local) = root.compute_point(anchor, &point) else {
+        return;
+    };
+    popover.set_pointing_to(Some(&gdk::Rectangle::new(
+        local.x() as i32,
+        local.y() as i32,
+        1,
+        1,
+    )));
+}
+
 pub fn context_menu(widget: &impl IsA<gtk4::Widget>, items: Vec<MenuAction>) {
     let popover = Popover::new();
     popover.set_has_arrow(true);
@@ -137,7 +162,7 @@ pub fn context_menu(widget: &impl IsA<gtk4::Widget>, items: Vec<MenuAction>) {
     let mouse = gtk4::EventControllerLegacy::new();
     mouse.set_propagation_phase(gtk4::PropagationPhase::Capture);
     let popup = popover.downgrade();
-    mouse.connect_event(move |_, event| {
+    mouse.connect_event(move |controller, event| {
         let Some(button) = event.downcast_ref::<gdk::ButtonEvent>() else {
             return gtk4::glib::Propagation::Proceed;
         };
@@ -148,6 +173,9 @@ pub fn context_menu(widget: &impl IsA<gtk4::Widget>, items: Vec<MenuAction>) {
         // the same release cannot dismiss the new popup.
         if event.event_type() == gdk::EventType::ButtonRelease {
             if let Some(popup) = popup.upgrade() {
+                if let Some(anchor) = controller.widget() {
+                    point_at_event(&popup, &anchor, event);
+                }
                 popup.popup();
             }
         }
