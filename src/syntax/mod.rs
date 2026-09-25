@@ -9,7 +9,8 @@ pub mod language;
 pub use highlight::{Highlighter, Segment};
 pub use language::detect_language;
 
-use sourceview5::{StyleScheme, StyleSchemeManager};
+use sourceview5::{Buffer as SourceBuffer, StyleScheme, StyleSchemeManager, prelude::*};
+use std::path::Path;
 
 /// The style scheme matching the current light/dark appearance (COLORS.md
 /// sections 17 and 32).
@@ -18,10 +19,20 @@ pub fn style_scheme() -> Option<StyleScheme> {
     StyleSchemeManager::default().scheme(if dark { "Adwaita-dark" } else { "Adwaita" })
 }
 
+/// Live syntax highlighting for editable text, without changing its contents.
+/// Unlike the static diff renderer, SourceBuffer updates styles after edits.
+pub fn editable_buffer(path: &Path, text: &str) -> SourceBuffer {
+    let buffer = SourceBuffer::new(None);
+    buffer.set_language(detect_language(path).as_ref());
+    buffer.set_style_scheme(style_scheme().as_ref());
+    buffer.set_highlight_syntax(true);
+    buffer.set_text(text);
+    buffer
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gtk4::prelude::*;
     use std::path::Path;
 
     /// GtkSourceView is bound to the thread that initialized GTK and
@@ -127,5 +138,27 @@ mod tests {
         // Without a language everything is plain (section 7).
         let plain = highlighter.highlight(None, scheme.as_ref(), &lines);
         assert!(plain.iter().all(|segments| segments.is_empty()));
+
+        // An editable Result retains exact text and highlights new content
+        // after both user edits and programmatic resolution choices.
+        let result = editable_buffer(Path::new("f.rs"), "let x = 1;");
+        let result_view = sourceview5::View::with_buffer(&result);
+        assert!(result_view.buffer().is::<SourceBuffer>());
+        assert_eq!(
+            result.text(&result.start_iter(), &result.end_iter(), true),
+            "let x = 1;"
+        );
+        result.ensure_highlight(&result.start_iter(), &result.end_iter());
+        let keyword_tags = result.start_iter().tags();
+        assert!(!keyword_tags.is_empty());
+        result.set_text("/* comment */");
+        result.ensure_highlight(&result.start_iter(), &result.end_iter());
+        assert_eq!(
+            result.text(&result.start_iter(), &result.end_iter(), true),
+            "/* comment */"
+        );
+        let comment_tags = result.start_iter().tags();
+        assert!(!comment_tags.is_empty());
+        assert_ne!(keyword_tags, comment_tags);
     }
 }

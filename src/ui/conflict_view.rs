@@ -329,7 +329,9 @@ fn block_view(
 
     // Actions with the operation-aware wording (§23-24).
     let actions = GtkBox::new(Orientation::Horizontal, 8);
-    let result_view = TextView::new();
+    // GtkSourceView renders the SourceBuffer's live syntax styles; a plain
+    // GtkTextView does not reliably display them while editing.
+    let result_view: TextView = sourceview5::View::new().upcast();
     let set_resolved_state = progress_updater(
         index,
         resolved_flags.clone(),
@@ -430,7 +432,6 @@ fn block_view(
         &session.path,
         initial.as_deref(),
         &result_view,
-        highlighter,
         callbacks,
         &set_resolved_state,
         &updating,
@@ -564,14 +565,12 @@ fn result_panel(
     path: &Path,
     initial: Option<&[u8]>,
     view: &TextView,
-    highlighter: &Highlighter,
     callbacks: &Rc<Callbacks>,
     set_resolved_state: &Rc<dyn Fn(bool)>,
     updating: &Rc<Cell<bool>>,
 ) -> (gtk4::Widget, SearchTarget) {
     let text = String::from_utf8_lossy(initial.unwrap_or(b""));
-    let lines: Vec<String> = text.lines().map(str::to_owned).collect();
-    let buffer = highlighted_buffer(path, &lines, highlighter);
+    let buffer = crate::syntax::editable_buffer(path, &text);
     view.set_buffer(Some(&buffer));
     view.set_editable(true);
     view.set_monospace(true);
@@ -600,7 +599,7 @@ fn result_panel(
     (
         view.clone().upcast(),
         SearchTarget {
-            buffer,
+            buffer: buffer.upcast(),
             view: view.clone(),
             hunk: None,
         },
