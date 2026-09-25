@@ -198,6 +198,7 @@ impl Inner {
         self_weak: Weak<Inner>,
         initial_view: InitialView,
     ) -> Self {
+        let file_history_startup = matches!(initial_view, InitialView::FileHistory(_));
         let pending_initial_file = RefCell::new(match initial_view {
             InitialView::Repository => None,
             InitialView::FileHistory(path) => Some(path),
@@ -229,29 +230,32 @@ impl Inner {
         spinner.set_tooltip_text(Some("Loading…"));
         header.pack_end(&spinner);
 
-        let changes = changes::ChangesView::new(changes::Callbacks {
-            copy: op_callback(&self_weak, Inner::copy_action),
-            open_editor: op_callback(&self_weak, Inner::open_in_editor),
-            select: {
-                let weak = self_weak.clone();
-                Box::new(move |selection| {
-                    if let Some(inner) = weak.upgrade() {
-                        inner.history_view.clear_selection();
-                        inner.select(selection);
-                    }
-                })
+        let changes = changes::ChangesView::new(
+            changes::Callbacks {
+                copy: op_callback(&self_weak, Inner::copy_action),
+                open_editor: op_callback(&self_weak, Inner::open_in_editor),
+                select: {
+                    let weak = self_weak.clone();
+                    Box::new(move |selection| {
+                        if let Some(inner) = weak.upgrade() {
+                            inner.history_view.clear_selection();
+                            inner.select(selection);
+                        }
+                    })
+                },
+                stage_file: op_callback(&self_weak, Inner::stage_file),
+                unstage_file: op_callback(&self_weak, Inner::unstage_file),
+                discard_file: {
+                    let weak = self_weak.clone();
+                    Box::new(move |path| {
+                        if let Some(inner) = weak.upgrade() {
+                            inner.confirm_discard_file(path);
+                        }
+                    })
+                },
             },
-            stage_file: op_callback(&self_weak, Inner::stage_file),
-            unstage_file: op_callback(&self_weak, Inner::unstage_file),
-            discard_file: {
-                let weak = self_weak.clone();
-                Box::new(move |path| {
-                    if let Some(inner) = weak.upgrade() {
-                        inner.confirm_discard_file(path);
-                    }
-                })
-            },
-        });
+            file_history_startup,
+        );
 
         let history_view = history::HistoryView::new(history::Callbacks {
             copy: op_callback(&self_weak, Inner::copy_action),
