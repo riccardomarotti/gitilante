@@ -208,9 +208,21 @@ mod tests {
 
     #[test]
     fn short_queries_run_nothing() {
-        // GITILANTE_SEARCH_SPEC.md section 34.
-        let repo = Repository::discover(Path::new(env!("CARGO_MANIFEST_DIR"))).unwrap();
+        // GITILANTE_SEARCH_SPEC.md section 34. CI checkouts need not contain
+        // Git metadata, so this test must use its own repository.
+        let dir =
+            std::env::temp_dir().join(format!("gitilante-contents-{}-short", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let status = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .arg(&dir)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let repo = Repository::discover(&dir).unwrap();
         assert!(search(&query("x"), &repo, &[]).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
