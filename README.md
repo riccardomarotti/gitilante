@@ -38,7 +38,9 @@ branch, merge, ...).
 - collapsible files and hunks with `+N −M` summaries: fold what you are not
   reviewing, with `Collapse/Expand all` actions from the header menu; the
   fold state survives refreshes and selection switches, and searches
-  automatically expand what they need to show.
+  automatically expand what they need to show;
+- split eligible modified-text hunks into independently actionable visual
+  parts without changing Git's original diff; `Unsplit` restores the original.
 
 ### History
 
@@ -79,7 +81,8 @@ branch, merge, ...).
 
 Right-click a file, hunk or commit to copy its repository-relative or absolute
 path, full file/hunk patch, commit SHA or commit info as appropriate. Right-click
-working-tree files in Changes, the diff viewer, a search preview or the conflict
+an eligible hunk to `Split hunk` or `Unsplit hunk`. Right-click working-tree
+files in Changes, the diff viewer, a search preview or the conflict
 solver to **Open in Editor**; historical diffs are not opened as current files.
 The editor is chosen from `GITILANTE_EDITOR`, `VISUAL`, `EDITOR`, then the
 desktop default. For example, `GITILANTE_EDITOR="code --reuse-window"` opens
