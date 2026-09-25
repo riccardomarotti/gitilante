@@ -355,11 +355,16 @@ pub fn render_file_preview(
     body.set_top_margin(4);
     body.set_bottom_margin(4);
     body.set_hexpand(true);
+    let copy_callbacks = callbacks.clone();
+    let copy_selection = clipboard::copy_selection_action(&buffer, move |text| {
+        (copy_callbacks.copy)(CopyAction::Text(text));
+    });
 
     let box_ = GtkBox::new(Orientation::Horizontal, 0);
     box_.add_css_class("frame");
     box_.append(&gutter_view);
     box_.append(&body);
+    clipboard::context_menu(&box_, vec![copy_selection]);
     root.append(&box_);
 
     if truncated {
@@ -711,30 +716,10 @@ fn hunk_view(
         DiffSide::Conflicted => {}
     }
     if !matches!(side, DiffSide::Conflicted) {
-        let mut actions: Vec<clipboard::MenuAction> = Vec::new();
-        if is_split {
-            let callbacks = callbacks.clone();
-            let origin_key = origin_key.clone();
-            actions.push((
-                "Unsplit hunk",
-                Box::new(move || (callbacks.toggle_split)(origin_key.clone())),
-            ));
-        } else if hunk_split::can_split(file, hunk) {
-            let callbacks = callbacks.clone();
-            let origin_key = origin_key.clone();
-            actions.push((
-                "Split hunk",
-                Box::new(move || (callbacks.toggle_split)(origin_key.clone())),
-            ));
-        }
-        let file = file.clone();
-        let hunk = hunk.clone();
-        let callbacks = callbacks.clone();
-        actions.push((
-            "Copy hunk diff",
-            Box::new(move || (callbacks.copy)(CopyAction::HunkDiff(file.clone(), hunk.clone()))),
-        ));
-        clipboard::context_menu(&header, actions);
+        clipboard::context_menu(
+            &header,
+            hunk_context_actions(file, hunk, origin_key, is_split, callbacks),
+        );
     }
     block.append(&header);
 
@@ -750,6 +735,19 @@ fn hunk_view(
     search_target.source_start = source_start;
     search_target.source_end = source_end;
     track_focus(&body, &target, callbacks);
+    if !matches!(side, DiffSide::Conflicted) {
+        let copy_callbacks = callbacks.clone();
+        let selected_text = clipboard::copy_selection_action(&search_target.buffer, move |text| {
+            (copy_callbacks.copy)(CopyAction::Text(text));
+        });
+        let mut actions = vec![selected_text];
+        actions.extend(hunk_context_actions(
+            file, hunk, origin_key, is_split, callbacks,
+        ));
+        if let Some(anchor) = search_target.view.parent() {
+            clipboard::context_menu(&anchor, actions);
+        }
+    }
     if matches!(side, DiffSide::Staged | DiffSide::Unstaged)
         && crate::git::patch::supports_selected_lines(file, hunk)
     {
@@ -763,6 +761,39 @@ fn hunk_view(
     }
     block.append(&body);
     (block.upcast(), Some(search_target))
+}
+
+fn hunk_context_actions(
+    file: &FileDiff,
+    hunk: &Hunk,
+    origin_key: &HunkFoldKey,
+    is_split: bool,
+    callbacks: &Rc<Callbacks>,
+) -> Vec<clipboard::MenuAction> {
+    let mut actions: Vec<clipboard::MenuAction> = Vec::new();
+    if is_split {
+        let callbacks = callbacks.clone();
+        let origin_key = origin_key.clone();
+        actions.push((
+            "Unsplit hunk",
+            Box::new(move || (callbacks.toggle_split)(origin_key.clone())),
+        ));
+    } else if hunk_split::can_split(file, hunk) {
+        let callbacks = callbacks.clone();
+        let origin_key = origin_key.clone();
+        actions.push((
+            "Split hunk",
+            Box::new(move || (callbacks.toggle_split)(origin_key.clone())),
+        ));
+    }
+    let file = file.clone();
+    let hunk = hunk.clone();
+    let callbacks = callbacks.clone();
+    actions.push((
+        "Copy hunk diff",
+        Box::new(move || (callbacks.copy)(CopyAction::HunkDiff(file.clone(), hunk.clone()))),
+    ));
+    actions
 }
 
 /// Maps a half-open GTK text selection to modified hunk-line indexes.

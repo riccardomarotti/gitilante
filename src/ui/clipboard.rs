@@ -25,6 +25,7 @@ pub enum CopyAction {
     AbsolutePath(PathBuf),
     FileDiff(FileDiff),
     HunkDiff(FileDiff, Hunk),
+    Text(String),
     CommitSha(Commit),
     CommitInfo(Commit),
 }
@@ -50,6 +51,7 @@ pub fn payload(action: CopyAction, root: &Path) -> Result<(String, &'static str)
             diff_text(crate::git::patch::single_hunk_patch(&file, &hunk))?,
             "Hunk diff copied",
         )),
+        CopyAction::Text(text) => Ok((text, "Text copied")),
         CopyAction::CommitSha(commit) => Ok((commit.oid, "Commit SHA copied")),
         CopyAction::CommitInfo(commit) => Ok((commit_info(&commit), "Commit info copied")),
     }
@@ -101,6 +103,22 @@ pub fn detach_context_menu(widget: &impl IsA<gtk4::Widget>) {
 /// Attaches a popup to an individual row/header, without selecting it.
 /// Each action owns the data of that row; the current selection is irrelevant.
 pub type MenuAction = (&'static str, Box<dyn Fn()>);
+
+/// Adds a menu action that copies the current text selection, if one exists.
+pub fn copy_selection_action(
+    buffer: &gtk4::TextBuffer,
+    copy: impl Fn(String) + 'static,
+) -> MenuAction {
+    let buffer = buffer.clone();
+    (
+        "Copy selected text",
+        Box::new(move || {
+            if let Some((start, end)) = buffer.selection_bounds() {
+                copy(buffer.text(&start, &end, true).to_string());
+            }
+        }),
+    )
+}
 
 /// GDK event coordinates are relative to the window surface; the popover's
 /// pointing rectangle must instead be relative to its anchor widget.
@@ -226,6 +244,10 @@ mod tests {
     fn diff_requires_exact_utf8() {
         assert_eq!(diff_text(b"+valid\n".to_vec()), Ok("+valid\n".to_owned()));
         assert!(diff_text(b"+bad\xff\n".to_vec()).is_err());
+        assert_eq!(
+            payload(CopyAction::Text("selected text".into()), Path::new("/repo")),
+            Ok(("selected text".into(), "Text copied"))
+        );
     }
 
     #[test]
