@@ -4,6 +4,7 @@
 //! Nothing in this module knows about GTK; it must stay testable on its own.
 
 pub mod command;
+pub mod compare;
 pub mod conflict;
 pub mod diff;
 pub mod error;

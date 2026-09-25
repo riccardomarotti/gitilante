@@ -13,6 +13,7 @@ use crate::git::patch::{self, ApplyTarget};
 use crate::model::commit::Commit;
 use crate::model::diff::{Diff, FileDiff, Hunk};
 use crate::model::refs::{CommitRef, HeadRef};
+use crate::model::revisions::{RevisionCandidate, RevisionComparison};
 use crate::model::status::{Status, StatusEntry, UnmergedInfo};
 
 /// Adds the purely derived visual metadata (intraline spans) to a freshly
@@ -106,6 +107,21 @@ impl Repository {
     /// (BRANCH.md section 11).
     pub fn head(&self) -> Result<Option<HeadRef>> {
         crate::git::refs::head(self)
+    }
+
+    /// Suggested commit-ish inputs for a revision comparison dialog.
+    pub fn revision_candidates(&self) -> Result<Vec<RevisionCandidate>> {
+        crate::git::refs::revision_candidates(self)
+    }
+
+    /// Resolves a revision expression to a full commit object ID.
+    pub fn resolve_revision(&self, revision: &str) -> Result<String> {
+        crate::git::compare::resolve_revision(self, revision)
+    }
+
+    /// Compares two commit-ish inputs with ordinary two-revision semantics.
+    pub fn compare_revisions(&self, from: &str, to: &str) -> Result<RevisionComparison> {
+        crate::git::compare::compare_revisions(self, from, to)
     }
 
     /// The working tree files: tracked plus untracked and not ignored

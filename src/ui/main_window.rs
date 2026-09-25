@@ -14,7 +14,9 @@ use std::rc::{Rc, Weak};
 
 use gtk4::gio;
 use gtk4::prelude::*;
-use gtk4::{Adjustment, Box as GtkBox, Button, Orientation, Paned, PolicyType, ScrolledWindow};
+use gtk4::{
+    Adjustment, Box as GtkBox, Button, Label, Orientation, Paned, PolicyType, ScrolledWindow,
+};
 use libadwaita as adw;
 use libadwaita::prelude::*;
 
@@ -28,6 +30,7 @@ use crate::git::repository::Repository;
 use crate::model::commit::Commit;
 use crate::model::diff::{Diff, FileDiff, Hunk};
 use crate::model::refs::{CommitRef, HeadRef};
+use crate::model::revisions::RevisionComparison;
 use crate::model::status::{Status, StatusEntry, UnmergedInfo};
 use crate::search::SearchQuery;
 use crate::search::SearchScope;
@@ -36,8 +39,8 @@ use crate::search::result::{
 };
 use crate::ui::worker::Worker;
 use crate::ui::{
-    DiffSide, HunkTarget, Selection, changes, clipboard, conflict_view, diff_view, external_editor,
-    folding, history, search, search_dialog, short_path, splitting,
+    DiffSide, HunkTarget, Selection, changes, clipboard, compare_dialog, conflict_view, diff_view,
+    external_editor, folding, history, search, search_dialog, short_path, splitting,
 };
 
 /// Commits per history block (SPEC section 16).
@@ -95,6 +98,10 @@ struct State {
     history_exhausted: bool,
     /// Diff of the selected commit, loaded lazily (SPEC section 22).
     commit_diff: Option<(String, Diff)>,
+    /// The active comparison snapshot, keyed by resolved full OIDs.
+    comparison: Option<RevisionComparison>,
+    /// Invalidates stale comparison workers, including requests closed by the user.
+    comparison_generation: u64,
     /// Content of the selected file preview, loaded lazily
     /// (GITILANTE_SEARCH_SPEC.md section 16).
     file_preview: Option<(PathBuf, Result<Vec<u8>, String>)>,
@@ -164,6 +171,10 @@ struct Inner {
     search_bar: search::SearchBar,
     /// Ctrl+Shift+F global search dialog (GITILANTE_SEARCH_SPEC.md §5).
     search_dialog: Rc<search_dialog::SearchDialog>,
+    /// Commit-to-commit comparison dialog.
+    compare_dialog: Rc<compare_dialog::CompareDialog>,
+    /// Revision suggestions are loaded once per window session.
+    revision_candidates_requested: Cell<bool>,
     /// Bumped on every search intent: stale results are dropped.
     search_generation: search_dialog::SearchGeneration,
     diff_box: GtkBox,
@@ -208,6 +219,10 @@ impl Inner {
         let subtitle = adw::WindowTitle::new("Gitilante", &short_path(repo.root()));
         let header = adw::HeaderBar::new();
         header.set_title_widget(Some(&subtitle));
+
+        let compare_button = Button::with_label("Compare");
+        compare_button.set_tooltip_text(Some("Compare two revisions"));
+        header.pack_start(&compare_button);
 
         let refresh_button = Button::from_icon_name("view-refresh-symbolic");
         refresh_button.set_tooltip_text(Some("Refresh (Ctrl+R)"));
@@ -359,6 +374,32 @@ impl Inner {
                 },
             }))
         };
+        let compare_dialog = Rc::new(compare_dialog::CompareDialog::new(
+            compare_dialog::Callbacks {
+                compare: op2_callback(&self_weak, Inner::start_comparison),
+                invalidate: {
+                    let weak = self_weak.clone();
+                    Box::new(move || {
+                        if let Some(inner) = weak.upgrade() {
+                            inner.invalidate_comparison();
+                        }
+                    })
+                },
+                load_candidates: {
+                    let weak = self_weak.clone();
+                    Box::new(move || {
+                        if let Some(inner) = weak.upgrade() {
+                            inner.load_revision_candidates();
+                        }
+                    })
+                },
+                on_open: {
+                    let app = app.clone();
+                    Box::new(move |open| crate::ui::app::suspend_hunk_shortcuts(&app, open))
+                },
+            },
+        ));
+
         let diff_panel = GtkBox::new(Orientation::Vertical, 0);
         diff_panel.append(search_bar.widget());
         diff_panel.append(&diff_scroll);
@@ -385,6 +426,15 @@ impl Inner {
             .title("Gitilante")
             .build();
         window.set_content(Some(&toast_overlay));
+
+        {
+            let weak = self_weak.clone();
+            compare_button.connect_clicked(move |_| {
+                if let Some(inner) = weak.upgrade() {
+                    inner.open_compare_dialog(None);
+                }
+            });
+        }
 
         // Ctrl+R (SPEC section 30).
         let refresh_action = gio::SimpleAction::new("refresh", None);
@@ -527,6 +577,8 @@ impl Inner {
             history_view,
             search_bar,
             search_dialog,
+            compare_dialog,
+            revision_candidates_requested: Cell::new(false),
             search_generation: search_dialog::SearchGeneration::default(),
             diff_box,
             diff_scroll,
@@ -549,6 +601,90 @@ impl Inner {
             self.spinner.stop();
             self.spinner.set_visible(false);
         }
+    }
+
+    fn open_compare_dialog(&self, values: Option<(String, String)>) {
+        self.compare_dialog.present(&self.window, values);
+    }
+
+    fn invalidate_comparison(&self) {
+        let mut state = self.state.borrow_mut();
+        state.comparison_generation = state.comparison_generation.wrapping_add(1);
+    }
+
+    fn load_revision_candidates(&self) {
+        if self.revision_candidates_requested.replace(true) {
+            return;
+        }
+        let repo = self.repo.clone();
+        let weak = self.self_weak.clone();
+        self.worker.run(
+            move || repo.revision_candidates(),
+            move |result| {
+                let Some(inner) = weak.upgrade() else { return };
+                match result {
+                    Ok(candidates) => inner.compare_dialog.set_candidates(candidates),
+                    Err(error) => {
+                        log::debug!("Revision suggestions unavailable: {error}");
+                        inner.revision_candidates_requested.set(false);
+                    }
+                }
+            },
+        );
+    }
+
+    fn start_comparison(&self, from: String, to: String) {
+        let generation = {
+            let mut state = self.state.borrow_mut();
+            state.comparison_generation = state.comparison_generation.wrapping_add(1);
+            state.comparison_generation
+        };
+        self.compare_dialog.show_comparing();
+        self.busy_start();
+        let repo = self.repo.clone();
+        let weak = self.self_weak.clone();
+        self.worker.run(
+            move || repo.compare_revisions(&from, &to),
+            move |result| {
+                if let Some(inner) = weak.upgrade() {
+                    inner.finish_comparison(generation, result);
+                }
+            },
+        );
+    }
+
+    fn finish_comparison(&self, generation: u64, result: Result<RevisionComparison, Error>) {
+        self.busy_finish();
+        if self.state.borrow().comparison_generation != generation {
+            return;
+        }
+        let comparison = match result {
+            Ok(comparison) => comparison,
+            Err(error) => {
+                log::warn!("Revision comparison failed: {error}");
+                if let Error::Git(git_error) = &error {
+                    log::warn!("{}", git_error.details());
+                }
+                self.compare_dialog
+                    .show_error(&comparison_error_message(&error));
+                return;
+            }
+        };
+        self.changes.clear_selection();
+        self.history_view.clear_selection();
+        {
+            let mut state = self.state.borrow_mut();
+            state.commit_diff_generation = state.commit_diff_generation.wrapping_add(1);
+            state.current_hunk = None;
+            state.selection = Some(Selection::Comparison {
+                from: comparison.from_oid.clone(),
+                to: comparison.to_oid.clone(),
+            });
+            state.comparison = Some(comparison);
+        }
+        self.last_reveal_query.borrow_mut().take();
+        self.compare_dialog.close();
+        self.render_diff();
     }
 
     // --- data loading ----------------------------------------------------
@@ -719,9 +855,10 @@ impl Inner {
                             .and_then(|entry| entry.unmerged())
                             .is_some_and(|info| *info == session.borrow().load.unmerged)
                     });
+                    let comparison = state.comparison.as_ref();
                     let selection = previous
                         .clone()
-                        .filter(|selection| selection_exists(&data.status, selection));
+                        .filter(|selection| selection_exists(&data.status, selection, comparison));
                     // After a resolution, the next conflict is selected (§63).
                     let next_conflict = if matches!(previous, Some(Selection::Conflicted(_))) {
                         data.status
@@ -1509,6 +1646,12 @@ impl Inner {
                     files: vec![find_file(side, path)?.clone()],
                 }
             }
+            Selection::Comparison { from, to } => {
+                let comparison = state.comparison.as_ref().filter(|comparison| {
+                    comparison.from_oid == *from && comparison.to_oid == *to
+                })?;
+                comparison.diff.clone()
+            }
             _ => return None,
         };
         Some((key, diff))
@@ -1622,9 +1765,10 @@ impl Inner {
         self.search_dialog.close();
         let located = {
             let state = self.state.borrow();
-            let side = state.data.as_ref().map(|data| match result.side {
-                DiffSide::Staged => &data.staged,
-                _ => &data.worktree,
+            let side = state.data.as_ref().and_then(|data| match result.side {
+                DiffSide::Staged => Some(&data.staged),
+                DiffSide::Unstaged => Some(&data.worktree),
+                DiffSide::History | DiffSide::Conflicted | DiffSide::Comparison => None,
             });
             side.and_then(|diff| find_file(diff, &result.path))
                 .and_then(|file| {
@@ -1649,7 +1793,8 @@ impl Inner {
         }
         let selection = match result.side {
             DiffSide::Staged => Selection::Staged(result.path.clone()),
-            _ => Selection::Unstaged(result.path.clone()),
+            DiffSide::Unstaged => Selection::Unstaged(result.path.clone()),
+            DiffSide::History | DiffSide::Conflicted | DiffSide::Comparison => return,
         };
         self.select(selection);
         self.render_changes();
@@ -1814,6 +1959,16 @@ impl Inner {
                 }
                 _ => diff_view::RenderedDiff::plain(diff_view::placeholder("Loading diff…")),
             },
+            Some(Selection::Comparison { from, to }) => match state
+                .comparison
+                .as_ref()
+                .filter(|comparison| comparison.from_oid == *from && comparison.to_oid == *to)
+            {
+                Some(comparison) => self.render_comparison_diff(comparison, focus.as_ref()),
+                None => {
+                    diff_view::RenderedDiff::plain(diff_view::placeholder("Comparison unavailable"))
+                }
+            },
             Some(Selection::FilePreview { path, line }) => match &state.file_preview {
                 Some((cached, content)) if cached == path => match content {
                     Ok(bytes) => {
@@ -1948,6 +2103,87 @@ impl Inner {
             }
         }
         rendered
+    }
+
+    /// Renders the stable comparison snapshot with the ordinary diff renderer.
+    fn render_comparison_diff(
+        &self,
+        comparison: &RevisionComparison,
+        focus: Option<&folding::FoldFocus>,
+    ) -> diff_view::RenderedDiff {
+        let key = folding::DiffDocumentKey::Comparison {
+            from: comparison.from_oid.clone(),
+            to: comparison.to_oid.clone(),
+        };
+        let split_keys = {
+            let mut splits = self.splits.borrow_mut();
+            splits.prune(&key, &comparison.diff);
+            splits.keys(&key)
+        };
+        let fold_live_diff = diff_with_split_parts(&comparison.diff, &split_keys, true);
+        let mut store = self.folds.borrow_mut();
+        let folds = store.for_document(&key);
+        folds.prune(&fold_live_diff);
+
+        let root = GtkBox::new(Orientation::Vertical, 12);
+        root.set_margin_top(12);
+        root.set_margin_bottom(12);
+        root.set_margin_start(12);
+        root.set_margin_end(12);
+        let title = Label::new(Some("Comparing revisions"));
+        title.add_css_class("title-3");
+        title.set_xalign(0.0);
+        root.append(&title);
+        let from_short: String = comparison.from_oid.chars().take(7).collect();
+        let to_short: String = comparison.to_oid.chars().take(7).collect();
+        let direction = format!(
+            "From: {} ({from_short})  →  To: {} ({to_short})",
+            comparison.from_input, comparison.to_input
+        );
+        let direction_label = Label::new(Some(&direction));
+        direction_label.set_xalign(0.0);
+        direction_label.set_ellipsize(gtk4::pango::EllipsizeMode::Middle);
+        direction_label.set_selectable(true);
+        direction_label.set_tooltip_text(Some(&format!(
+            "From: {} ({}) → To: {} ({})",
+            comparison.from_input, comparison.from_oid, comparison.to_input, comparison.to_oid
+        )));
+        root.append(&direction_label);
+        let change = Button::with_label("Change…");
+        change.set_halign(gtk4::Align::Start);
+        let weak = self.self_weak.clone();
+        let values = (comparison.from_input.clone(), comparison.to_input.clone());
+        change.connect_clicked(move |_| {
+            if let Some(inner) = weak.upgrade() {
+                inner.open_compare_dialog(Some(values.clone()));
+            }
+        });
+        root.append(&change);
+
+        let mut targets = Vec::new();
+        if comparison.diff.is_empty() {
+            root.append(&diff_view::placeholder(
+                "No changes between these revisions",
+            ));
+        } else {
+            for file in &comparison.diff.files {
+                let rendered = diff_view::render(
+                    file,
+                    DiffSide::Comparison,
+                    &self.highlighter,
+                    folds,
+                    &split_keys,
+                    focus,
+                    &self.diff_callbacks(),
+                );
+                root.append(&rendered.widget);
+                targets.extend(rendered.targets);
+            }
+        }
+        diff_view::RenderedDiff {
+            widget: root.upcast(),
+            targets,
+        }
     }
 
     /// Renders every file of a commit diff with the same renderer (SPEC §17).
@@ -2386,8 +2622,28 @@ fn op2_callback<T: 'static, U: 'static>(
     })
 }
 
+fn comparison_error_message(error: &Error) -> String {
+    if let Error::InvalidRevision { revision, detail } = error {
+        let lower = detail.to_ascii_lowercase();
+        if lower.contains("not a commit")
+            || lower.contains("is a tree")
+            || lower.contains("is a blob")
+        {
+            format!("Revision is not a commit: {revision}")
+        } else {
+            format!("Unknown revision: {revision}")
+        }
+    } else {
+        "Could not compare these revisions; see the application log for details".to_owned()
+    }
+}
+
 /// True when `selection` still exists in `status`.
-fn selection_exists(status: &Status, selection: &Selection) -> bool {
+fn selection_exists(
+    status: &Status,
+    selection: &Selection,
+    comparison: Option<&RevisionComparison>,
+) -> bool {
     match selection {
         Selection::Staged(path) => status.staged_entries().any(|entry| entry.path == *path),
         Selection::Unstaged(path) => status.unstaged_entries().any(|entry| entry.path == *path),
@@ -2395,6 +2651,8 @@ fn selection_exists(status: &Status, selection: &Selection) -> bool {
         Selection::Conflicted(path) => status.unmerged_entries().any(|entry| entry.path == *path),
         // Commits are immutable: a selected commit stays valid across refreshes.
         Selection::Commit(_) => true,
+        Selection::Comparison { from, to } => comparison
+            .is_some_and(|comparison| comparison.from_oid == *from && comparison.to_oid == *to),
         Selection::FilePreview { .. } => true,
     }
 }
@@ -2618,6 +2876,50 @@ mod split_navigation_tests {
 mod file_history_tests {
     use super::*;
     use crate::model::status::{ChangeKind, StatusEntryKind};
+
+    #[test]
+    fn comparison_errors_are_short_and_distinguish_non_commit_objects() {
+        assert_eq!(
+            comparison_error_message(&Error::InvalidRevision {
+                revision: "missing".to_owned(),
+                detail: "fatal: Needed a single revision".to_owned(),
+            }),
+            "Unknown revision: missing"
+        );
+        assert_eq!(
+            comparison_error_message(&Error::InvalidRevision {
+                revision: "blob-tag".to_owned(),
+                detail: "error: object is a blob, not a commit".to_owned(),
+            }),
+            "Revision is not a commit: blob-tag"
+        );
+    }
+
+    #[test]
+    fn comparison_selection_survives_refresh_only_while_its_snapshot_exists() {
+        let status = Status::default();
+        let comparison = RevisionComparison {
+            from_input: "main".to_owned(),
+            to_input: "feature".to_owned(),
+            from_oid: "full-a".to_owned(),
+            to_oid: "full-b".to_owned(),
+            diff: Diff::default(),
+        };
+        let selection = Selection::Comparison {
+            from: "full-a".to_owned(),
+            to: "full-b".to_owned(),
+        };
+        assert!(selection_exists(&status, &selection, Some(&comparison)));
+        assert!(!selection_exists(&status, &selection, None));
+        assert!(!selection_exists(
+            &status,
+            &Selection::Comparison {
+                from: "full-b".to_owned(),
+                to: "full-a".to_owned(),
+            },
+            Some(&comparison)
+        ));
+    }
 
     #[test]
     fn staged_rename_seed_resolution_is_shared() {

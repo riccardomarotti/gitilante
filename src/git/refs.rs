@@ -12,6 +12,7 @@ use crate::git::command;
 use crate::git::error::Error;
 use crate::git::repository::Repository;
 use crate::model::refs::{CommitRef, HeadRef, RefKind};
+use crate::model::revisions::{RevisionCandidate, RevisionKind};
 
 /// Machine readable ref record: object name and full refname, NUL separated.
 const REF_FORMAT: &str = "%(objectname)%00%(refname)";
@@ -46,6 +47,62 @@ pub fn commit_refs(repo: &Repository) -> Result<HashMap<String, Vec<CommitRef>>>
         commit_refs.sort();
     }
     Ok(refs)
+}
+
+/// Returns deterministic suggestions for arbitrary commit-ish input fields.
+///
+/// This is deliberately separate from [`commit_refs`]: tags belong in the
+/// comparison dialog but not in History graph badges.
+pub fn revision_candidates(repo: &Repository) -> Result<Vec<RevisionCandidate>> {
+    let output = command::run(
+        repo.root(),
+        &[
+            "for-each-ref",
+            "--format=%(refname)",
+            "refs/heads/",
+            "refs/remotes/",
+            "refs/tags/",
+        ],
+    )?;
+    let refs = std::str::from_utf8(&output.stdout).map_err(|error| Error::MalformedOutput {
+        command: "for-each-ref".to_owned(),
+        detail: format!("expected UTF-8 ref names: {error}"),
+    })?;
+
+    let mut candidates = Vec::new();
+    if repo.head()?.is_some() {
+        candidates.push(RevisionCandidate {
+            label: "HEAD".to_owned(),
+            spec: "HEAD".to_owned(),
+            kind: RevisionKind::Head,
+        });
+    }
+    for refname in refs.lines() {
+        let (prefix, kind) = if let Some(name) = refname.strip_prefix("refs/heads/") {
+            (name, RevisionKind::LocalBranch)
+        } else if let Some(name) = refname.strip_prefix("refs/remotes/") {
+            if name == "HEAD" || name.ends_with("/HEAD") {
+                continue;
+            }
+            (name, RevisionKind::RemoteBranch)
+        } else if let Some(name) = refname.strip_prefix("refs/tags/") {
+            (name, RevisionKind::Tag)
+        } else {
+            continue;
+        };
+        candidates.push(RevisionCandidate {
+            label: prefix.to_owned(),
+            spec: refname.to_owned(),
+            kind,
+        });
+    }
+    candidates.sort_by(|left, right| {
+        left.kind
+            .cmp(&right.kind)
+            .then_with(|| left.label.cmp(&right.label))
+            .then_with(|| left.spec.cmp(&right.spec))
+    });
+    Ok(candidates)
 }
 
 /// Resolves HEAD (BRANCH.md section 11).

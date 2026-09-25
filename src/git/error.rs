@@ -53,6 +53,8 @@ pub enum Error {
     /// The path cannot be mapped to a repository or file identity
     /// (CLI_FILE_HISTORY §9-§10).
     InvalidPath { path: PathBuf },
+    /// A revision expression did not resolve to a commit object.
+    InvalidRevision { revision: String, detail: String },
     /// A patch (or its reverse) no longer applies cleanly: the repository
     /// changed after the diff it was built from was read.
     PatchDoesNotApply { stderr: String },
@@ -75,6 +77,12 @@ impl fmt::Display for Error {
             Self::NotARepository { path } => write!(f, "Not a Git repository: {}", path.display()),
             Self::PathNotFound { path } => write!(f, "Path does not exist: {}", path.display()),
             Self::InvalidPath { path } => write!(f, "Cannot open this path: {}", path.display()),
+            Self::InvalidRevision { revision, detail } => {
+                write!(
+                    f,
+                    "Cannot resolve revision {revision:?} to a commit.\n\n{detail}"
+                )
+            }
             Self::PatchDoesNotApply { stderr } => {
                 write!(
                     f,

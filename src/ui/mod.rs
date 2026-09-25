@@ -3,6 +3,7 @@
 pub mod app;
 pub mod changes;
 pub mod clipboard;
+pub mod compare_dialog;
 pub mod conflict_view;
 pub mod diff_view;
 pub mod external_editor;
@@ -31,6 +32,8 @@ pub enum Selection {
     Commit(String),
     /// A conflicted (unmerged) file, shown read-only.
     Conflicted(PathBuf),
+    /// A read-only comparison between two resolved commit IDs.
+    Comparison { from: String, to: String },
     /// A read-only file preview opened by the search
     /// (GITILANTE_SEARCH_SPEC.md sections 16 and 41).
     FilePreview {
@@ -59,10 +62,12 @@ pub enum DiffSide {
     Staged,
     /// The working tree (`git diff`).
     Unstaged,
-    /// A historical commit (`git show`); hunks get their actions in Fase 6.
+    /// A historical commit diff, with hunk revert actions.
     History,
     /// A conflicted file (combined diff), read-only.
     Conflicted,
+    /// A read-only commit-to-commit comparison.
+    Comparison,
 }
 
 /// Short letter describing a change kind.

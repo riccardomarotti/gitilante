@@ -35,6 +35,8 @@ branch, merge, ...).
 - line colors for added/removed lines with an extra overlay on the parts that
   actually changed inside a line (intraline diff);
 - commit diffs render every file with the same viewer;
+- compare any two commit-ish revisions (branches, remote branches, tags, SHAs
+  and `HEAD` expressions) in a directional, read-only unified diff;
 - collapsible files and hunks with `+N −M` summaries: fold what you are not
   reviewing, with `Collapse/Expand all` actions from the header menu; the
   fold state survives refreshes and selection switches, and searches

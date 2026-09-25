@@ -546,9 +546,8 @@ fn file_header(
                 move || (callbacks.discard_file)(path.clone())
             }));
         }
-        // Historical commits and conflicted files have no file actions: hunks
-        // get [Revert hunk], conflicted files are read-only (SPEC §§ 19, 31).
-        DiffSide::History | DiffSide::Conflicted => {}
+        // History and read-only comparison documents have no write actions.
+        DiffSide::History | DiffSide::Conflicted | DiffSide::Comparison => {}
     }
     header.upcast()
 }
@@ -713,7 +712,7 @@ fn hunk_view(
             );
         }
         // Conflicted files are read-only (SPEC sections 25 and 31).
-        DiffSide::Conflicted => {}
+        DiffSide::Conflicted | DiffSide::Comparison => {}
     }
     if !matches!(side, DiffSide::Conflicted) {
         clipboard::context_menu(

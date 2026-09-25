@@ -598,7 +598,10 @@ fn result_row(result: &SearchResult) -> ListBoxRow {
             });
             badges.push(match change.side {
                 crate::ui::DiffSide::Staged => "staged",
-                _ => "unstaged",
+                crate::ui::DiffSide::Unstaged => "unstaged",
+                crate::ui::DiffSide::History => "history",
+                crate::ui::DiffSide::Conflicted => "conflicted",
+                crate::ui::DiffSide::Comparison => "comparison",
             });
             (
                 change.path.display().to_string(),

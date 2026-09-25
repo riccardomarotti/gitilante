@@ -183,6 +183,7 @@ pub enum DiffDocumentKey {
     Staged(PathBuf),
     Conflicted(PathBuf),
     Commit(String),
+    Comparison { from: String, to: String },
 }
 
 impl DiffDocumentKey {
@@ -193,6 +194,10 @@ impl DiffDocumentKey {
             Selection::Staged(path) => Some(DiffDocumentKey::Staged(path.clone())),
             Selection::Conflicted(path) => Some(DiffDocumentKey::Conflicted(path.clone())),
             Selection::Commit(oid) => Some(DiffDocumentKey::Commit(oid.clone())),
+            Selection::Comparison { from, to } => Some(DiffDocumentKey::Comparison {
+                from: from.clone(),
+                to: to.clone(),
+            }),
             Selection::Untracked(_) | Selection::FilePreview { .. } => None,
         }
     }
@@ -207,7 +212,7 @@ pub fn document_key_for_file(
         crate::ui::DiffSide::Staged => Some(DiffDocumentKey::Staged(path.to_path_buf())),
         crate::ui::DiffSide::Unstaged => Some(DiffDocumentKey::Unstaged(path.to_path_buf())),
         crate::ui::DiffSide::Conflicted => Some(DiffDocumentKey::Conflicted(path.to_path_buf())),
-        crate::ui::DiffSide::History => None,
+        crate::ui::DiffSide::History | crate::ui::DiffSide::Comparison => None,
     }
 }
 
@@ -376,6 +381,28 @@ mod tests {
         assert!(state.is_file_collapsed(&FileFoldKey::from_file(&smaller.files[0])));
         assert_eq!(state.collapsed_files.len(), 1);
         assert_eq!(state.collapsed_hunks.len(), 1);
+    }
+
+    #[test]
+    fn comparison_fold_identity_preserves_direction() {
+        let forward = Selection::Comparison {
+            from: "full-a".to_owned(),
+            to: "full-b".to_owned(),
+        };
+        let reverse = Selection::Comparison {
+            from: "full-b".to_owned(),
+            to: "full-a".to_owned(),
+        };
+        let forward_key = DiffDocumentKey::from_selection(&forward).unwrap();
+        let reverse_key = DiffDocumentKey::from_selection(&reverse).unwrap();
+        assert_ne!(forward_key, reverse_key);
+        assert_eq!(
+            forward_key,
+            DiffDocumentKey::Comparison {
+                from: "full-a".to_owned(),
+                to: "full-b".to_owned(),
+            }
+        );
     }
 
     #[test]
