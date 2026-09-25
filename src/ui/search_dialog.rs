@@ -546,16 +546,21 @@ fn activate_selected(shared: &Rc<Shared>) {
         activate_row(shared, row.index());
         return;
     }
-    if let Some(first) = shared.rows.borrow().iter().position(Option::is_some) {
+    let first = first_result_index(&shared.rows);
+    if let Some(first) = first {
         activate_row(shared, first as i32);
     }
 }
 
+fn first_result_index<T>(rows: &RefCell<Vec<Option<T>>>) -> Option<usize> {
+    rows.borrow().iter().position(Option::is_some)
+}
+
 fn activate_row(shared: &Rc<Shared>, index: i32) {
-    let Some(Some(result)) = shared.rows.borrow().get(index as usize).cloned() else {
-        return;
-    };
-    (shared.callbacks.activate)(result, shared.query.borrow().clone());
+    let result = shared.rows.borrow().get(index as usize).cloned().flatten();
+    let Some(result) = result else { return };
+    let query = shared.query.borrow().clone();
+    (shared.callbacks.activate)(result, query);
 }
 
 /// A non-selectable group header row (GITILANTE_SEARCH_SPEC.md section 31).
@@ -693,6 +698,19 @@ fn short_oid(oid: &str) -> &str {
 
 #[cfg(test)]
 mod lifecycle_tests {
+    use std::cell::RefCell;
+
+    #[test]
+    fn enter_releases_rows_borrow_before_activation_closes_dialog() {
+        let rows = RefCell::new(vec![None, Some(42)]);
+        if let Some(first) = super::first_result_index(&rows) {
+            assert_eq!(first, 1);
+            // Closing the dialog clears rows synchronously in the callback.
+            rows.borrow_mut().clear();
+        }
+        assert!(rows.borrow().is_empty());
+    }
+
     use super::SearchGeneration;
 
     #[test]
