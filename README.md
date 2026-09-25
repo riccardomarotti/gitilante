@@ -121,14 +121,6 @@ cargo build --release
 ./target/release/gitilante ~/src/project
 ```
 
-Passing a file opens its File History; passing a directory opens the
-repository normally:
-
-```bash
-gila .
-gila src/ui/main_window.rs
-```
-
 Or install it with `cargo install --path .`, or from the AUR in two flavors:
 
 ```bash
@@ -138,6 +130,14 @@ yay -S gitilante-bin   # installs the official prebuilt binary
 
 Both install the same application (`gitilante`, its `gila` alias and the
 desktop/icon/metainfo files) and conflict with each other.
+
+Passing a file opens its File History; passing a directory opens the
+repository normally:
+
+```bash
+gila .
+gila src/ui/main_window.rs
+```
 
 Diagnostics are logged through `env_logger` (`RUST_LOG=debug` shows every Git
 command with its duration and exit status).
