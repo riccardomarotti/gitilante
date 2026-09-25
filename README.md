@@ -3,8 +3,8 @@
 ![demo](demo.gif)
 
 A lightweight open source Git GUI, focused on the operations that are more
-convenient in a graphical interface than in a terminal: reviewing the current
-changes and manipulating single hunks.
+convenient in a graphical interface than in a terminal: reviewing changes,
+resolving conflicts, and manipulating hunks or selected lines.
 
 Gitilante is a thin frontend over the `git` executable: it never reimplements
 Git semantics and deliberately does not replace the CLI (no commit, push,
@@ -17,10 +17,14 @@ branch, merge, ...).
 - open a repository from the command line, from any of its subdirectories;
 - Changes view with Staged / Unstaged / Untracked sections;
 - per-file and per-hunk actions: Stage, Unstage, Discard (with confirmation);
+- select changed lines within one hunk to Stage, Unstage or Discard just those
+  lines; partial replacements are supported;
 - Revert a single hunk of a commit into the working tree, without creating
   any commit;
 - binary files shown as such, with whole-file actions;
-- conflicted files listed in their own read-only section;
+- conflicted files open a solver with operation-aware labels, side-by-side
+  choices, editable results and whole-file choices for non-text conflicts;
+  applying a resolution checks for external changes before writing and staging;
 - refresh after every operation, on window focus, and with `Ctrl+R`.
 
 ### Diff viewer
@@ -42,7 +46,10 @@ branch, merge, ...).
 - commit graph with lanes, merges and branches, built from the commit DAG;
 - badges for local and remote branches, with the current branch emphasized
   and an explicit `HEAD` badge on detached HEADs;
-- the history covers unmerged branches and remote branches too.
+- the repository history covers unmerged branches and remote branches too;
+- **File History** from a staged/unstaged file or a tracked search preview
+  follows renames from `HEAD` and shows only that file's diff for each commit;
+  `All history` returns to the repository view.
 
 ### Search
 
@@ -51,19 +58,32 @@ branch, merge, ...).
   automatic scrolling;
 - `Ctrl+Shift+F` searches the repository with the scopes
   `All | Changes | Files | Contents | History | History Changes`:
-  - **Changes** — only the added/removed lines of the diffs on screen, with an
-    Added / Removed filter;
+  - **Changes** — added/removed lines in the current staged and unstaged
+    diffs, with an Added / Removed filter;
   - **Files** — fuzzy file name and path search (`hist rs` finds
     `src/git/history.rs`);
   - **Contents** — working tree contents, untracked non-ignored files
     included, binaries skipped;
-  - **History** — commit subject, author, object names and branch/ref names;
-  - **History Changes** — commits that added or removed a string
-    (`git log -S` / `-G`);
+  - **History** — commit subject, author, full/abbreviated commit ID and
+    branch/ref names;
+  - **History Changes** — commits where a string's occurrence count changed
+    (`git log -S`), or whose diffs match a regex (`git log -G`);
 - regular expression toggle (`.*`) and smart-case toggle (`Aa`);
 - every result navigates to its match: the right line is revealed and
   highlighted;
-- read-only file preview with line numbers and syntax highlighting.
+- read-only working-tree file preview with line numbers and syntax highlighting;
+- stale asynchronous results are discarded when the query changes or the
+  dialog closes.
+
+### Context actions
+
+Right-click a file, hunk or commit to copy its repository-relative or absolute
+path, full file/hunk patch, commit SHA or commit info as appropriate. Right-click
+working-tree files in Changes, the diff viewer, a search preview or the conflict
+solver to **Open in Editor**; historical diffs are not opened as current files.
+The editor is chosen from `GITILANTE_EDITOR`, `VISUAL`, `EDITOR`, then the
+desktop default. For example, `GITILANTE_EDITOR="code --reuse-window"` opens
+files in a graphical editor without changing your Git commit-message editor.
 
 ### Keyboard
 
@@ -89,6 +109,7 @@ in a search field.
 - Linux
 - Rust (1.85+), GTK 4, libadwaita and GtkSourceView 5 development packages
 - `git` in `PATH`
+- `git-lfs` only for repositories that use Git LFS (optional for other repos)
 
 ## Build and run
 
