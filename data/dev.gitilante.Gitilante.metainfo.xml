@@ -29,6 +29,7 @@
     <binary>gitilante</binary>
   </provides>
   <releases>
+    <release version="0.8.1" date="2026-09-25"/>
     <release version="0.8.0" date="2026-09-24"/>
     <release version="0.7.2" date="2026-09-24"/>
     <release version="0.7.1" date="2026-09-24"/>
