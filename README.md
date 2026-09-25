@@ -118,6 +118,14 @@ cargo build --release
 ./target/release/gitilante ~/src/project
 ```
 
+Passing a file opens its File History; passing a directory opens the
+repository normally:
+
+```bash
+gila .
+gila src/ui/main_window.rs
+```
+
 Or install it with `cargo install --path .`, or from the AUR in two flavors:
 
 ```bash

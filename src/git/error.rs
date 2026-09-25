@@ -48,6 +48,11 @@ pub enum Error {
     Io { command: String, source: io::Error },
     /// The given path does not belong to a Git repository.
     NotARepository { path: PathBuf },
+    /// The given path does not exist on the filesystem (CLI_FILE_HISTORY §6).
+    PathNotFound { path: PathBuf },
+    /// The path cannot be mapped to a repository or file identity
+    /// (CLI_FILE_HISTORY §9-§10).
+    InvalidPath { path: PathBuf },
     /// A patch (or its reverse) no longer applies cleanly: the repository
     /// changed after the diff it was built from was read.
     PatchDoesNotApply { stderr: String },
@@ -68,6 +73,8 @@ impl fmt::Display for Error {
                 write!(f, "Could not run Git.\n\n{command}\n\n{source}")
             }
             Self::NotARepository { path } => write!(f, "Not a Git repository: {}", path.display()),
+            Self::PathNotFound { path } => write!(f, "Path does not exist: {}", path.display()),
+            Self::InvalidPath { path } => write!(f, "Cannot open this path: {}", path.display()),
             Self::PatchDoesNotApply { stderr } => {
                 write!(
                     f,

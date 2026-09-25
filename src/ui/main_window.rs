@@ -18,6 +18,7 @@ use gtk4::{Adjustment, Box as GtkBox, Button, Orientation, Paned, PolicyType, Sc
 use libadwaita as adw;
 use libadwaita::prelude::*;
 
+use crate::cli::InitialView;
 use crate::conflict::presentation::ConflictPresentation;
 use crate::conflict::resolution::ConflictResolution;
 use crate::git::Error;
@@ -133,6 +134,9 @@ struct Inner {
     repo: Repository,
     worker: Worker,
     state: RefCell<State>,
+    /// One-shot File History target from the CLI, applied after the first
+    /// successful refresh (GITILANTE_CLI_FILE_HISTORY_SPEC.md §20-§22).
+    pending_initial_file: RefCell<Option<PathBuf>>,
     /// In-flight requests, shown by the header bar spinner.
     busy: Cell<u32>,
     /// Shared syntax highlighting resources (COLORS.md section 49).
@@ -173,9 +177,10 @@ pub struct MainWindow {
 
 impl MainWindow {
     /// Builds the window for `repo` (without showing it).
-    pub fn new(app: &adw::Application, repo: Repository) -> Self {
-        let inner: Rc<Inner> =
-            Rc::new_cyclic(|weak: &Weak<Inner>| Inner::build(app, repo, weak.clone()));
+    pub fn new(app: &adw::Application, repo: Repository, initial_view: InitialView) -> Self {
+        let inner: Rc<Inner> = Rc::new_cyclic(|weak: &Weak<Inner>| {
+            Inner::build(app, repo, weak.clone(), initial_view)
+        });
         inner.refresh();
         Self { inner }
     }
@@ -187,7 +192,16 @@ impl MainWindow {
 }
 
 impl Inner {
-    fn build(app: &adw::Application, repo: Repository, self_weak: Weak<Inner>) -> Self {
+    fn build(
+        app: &adw::Application,
+        repo: Repository,
+        self_weak: Weak<Inner>,
+        initial_view: InitialView,
+    ) -> Self {
+        let pending_initial_file = RefCell::new(match initial_view {
+            InitialView::Repository => None,
+            InitialView::FileHistory(path) => Some(path),
+        });
         let subtitle = adw::WindowTitle::new("Gitilante", &short_path(repo.root()));
         let header = adw::HeaderBar::new();
         header.set_title_widget(Some(&subtitle));
@@ -489,6 +503,7 @@ impl Inner {
             repo,
             worker: Worker::new(),
             state: RefCell::new(State::default()),
+            pending_initial_file,
             busy: Cell::new(0),
             highlighter: crate::syntax::Highlighter::new(),
             folds: RefCell::new(folding::FoldStateStore::default()),
@@ -724,6 +739,16 @@ impl Inner {
         }
         self.render_changes();
         self.render_diff();
+        // One-shot CLI target (GITILANTE_CLI_FILE_HISTORY_SPEC.md §20-§23):
+        // applied only after a successful refresh and never re-applied; the
+        // mode switch invalidates the startup Repository History request.
+        let initial_file = {
+            let mut pending = self.pending_initial_file.borrow_mut();
+            take_pending_after_refresh(&mut pending, true)
+        };
+        if let Some(path) = initial_file {
+            self.open_preview_history(path);
+        }
         self.search_dialog.rerun_if_open();
         // Open the solver when a selected conflict has no session yet (§58).
         let pending_conflict = {
@@ -2097,13 +2122,7 @@ impl Inner {
         let seed_path = if file.status == crate::model::diff::FileStatus::Renamed {
             file.old_path.clone()
         } else {
-            // A staged rename can have additional unstaged changes whose diff
-            // only mentions the new path; status still knows its HEAD path.
-            self.entry_for(&display_path).and_then(|entry| {
-                (entry.staged_change() == Some(crate::model::status::ChangeKind::Renamed))
-                    .then_some(entry.orig_path)
-                    .flatten()
-            })
+            Some(self.file_history_seed(&display_path))
         }
         .unwrap_or_else(|| display_path.clone());
         self.set_history_mode(HistoryMode::File {
@@ -2113,18 +2132,22 @@ impl Inner {
     }
 
     fn open_preview_history(&self, display_path: PathBuf) {
-        let seed_path = self
-            .entry_for(&display_path)
-            .and_then(|entry| {
-                (entry.staged_change() == Some(crate::model::status::ChangeKind::Renamed))
-                    .then_some(entry.orig_path)
-                    .flatten()
-            })
-            .unwrap_or_else(|| display_path.clone());
+        let seed_path = self.file_history_seed(&display_path);
         self.set_history_mode(HistoryMode::File {
             display_path,
             seed_path,
         });
+    }
+
+    /// Rename-aware File History seed, shared by every entry point
+    /// (GITILANTE_CLI_FILE_HISTORY_SPEC.md §15-§17).
+    fn file_history_seed(&self, display_path: &Path) -> PathBuf {
+        self.state
+            .borrow()
+            .data
+            .as_ref()
+            .map(|data| seed_path_for(&data.status, display_path))
+            .unwrap_or_else(|| display_path.to_path_buf())
     }
 
     fn stage_file(&self, path: PathBuf) {
@@ -2330,6 +2353,29 @@ fn find_file<'a>(diff: &'a Diff, path: &Path) -> Option<&'a FileDiff> {
         .find(|file| file.path() == Some(path) || file.old_path.as_deref() == Some(path))
 }
 
+/// Rename-aware File History seed resolution
+/// (GITILANTE_CLI_FILE_HISTORY_SPEC.md §15-§18): a staged rename follows the
+/// original HEAD path; every other entry follows the display path itself.
+fn seed_path_for(status: &Status, display_path: &Path) -> PathBuf {
+    status
+        .entries
+        .iter()
+        .find(|entry| entry.path == display_path)
+        .and_then(|entry| {
+            (entry.staged_change() == Some(crate::model::status::ChangeKind::Renamed))
+                .then_some(entry.orig_path.clone())
+                .flatten()
+        })
+        .unwrap_or_else(|| display_path.to_path_buf())
+}
+
+/// Consumes the pending startup File History target after a refresh
+/// (GITILANTE_CLI_FILE_HISTORY_SPEC.md §20-§22): only a successful refresh
+/// applies it, and it is applied exactly once.
+fn take_pending_after_refresh(pending: &mut Option<PathBuf>, refresh_ok: bool) -> Option<PathBuf> {
+    if refresh_ok { pending.take() } else { None }
+}
+
 fn subtitle_text(root: &Path, status: &Status) -> String {
     use crate::model::status::Head;
     let branch = match &status.branch.head {
@@ -2376,10 +2422,54 @@ fn toast_message(error: &Error) -> String {
 #[cfg(test)]
 mod file_history_tests {
     use super::*;
+    use crate::model::status::{ChangeKind, StatusEntryKind};
+
+    #[test]
+    fn staged_rename_seed_resolution_is_shared() {
+        // §16-§17: the display path is the new name and the seed follows the
+        // pre-rename HEAD lineage.
+        let status = Status {
+            entries: vec![StatusEntry {
+                path: PathBuf::from("src/new.rs"),
+                orig_path: Some(PathBuf::from("src/old.rs")),
+                kind: StatusEntryKind::Tracked {
+                    index: ChangeKind::Renamed,
+                    worktree: ChangeKind::Unmodified,
+                },
+            }],
+            ..Status::default()
+        };
+        assert_eq!(
+            seed_path_for(&status, Path::new("src/new.rs")),
+            PathBuf::from("src/old.rs")
+        );
+        // §18: unchanged files follow the display path itself.
+        assert_eq!(
+            seed_path_for(&status, Path::new("src/other.rs")),
+            PathBuf::from("src/other.rs")
+        );
+    }
+
+    #[test]
+    fn initial_file_target_is_consumed_once() {
+        // §20-§22: a failed refresh keeps the target; the first successful
+        // refresh applies it; later refreshes never re-apply it.
+        let mut pending = Some(PathBuf::from("foo.rs"));
+        assert_eq!(take_pending_after_refresh(&mut pending, false), None);
+        assert_eq!(pending, Some(PathBuf::from("foo.rs")));
+        assert_eq!(
+            take_pending_after_refresh(&mut pending, true),
+            Some(PathBuf::from("foo.rs"))
+        );
+        assert_eq!(pending, None);
+        assert_eq!(take_pending_after_refresh(&mut pending, true), None);
+    }
 
     #[test]
     fn mode_switch_invalidates_old_pages_and_resets_pagination() {
         let mut state = State::default();
+        // §38: a Repository History request started before the CLI File
+        // History switch has a generation that `finish_history` drops.
         let repository_request = state.history_generation;
         state.history_loading = true;
         state.history_exhausted = true;

@@ -7,6 +7,7 @@ use gtk4::gio;
 use gtk4::prelude::*;
 use libadwaita as adw;
 
+use crate::cli::InitialView;
 use crate::git::repository::Repository;
 use crate::ui::main_window::MainWindow;
 
@@ -46,8 +47,9 @@ pub fn suspend_hunk_shortcuts(app: &adw::Application, suspended: bool) {
     app.set_accels_for_action("win.revert-hunk", revert);
 }
 
-/// Runs the Gitilante GUI on `repo`, returning the process exit code.
-pub fn run(repo: Repository) -> i32 {
+/// Runs the Gitilante GUI on `repo`, showing `initial_view` after the first
+/// refresh (GITILANTE_CLI_FILE_HISTORY_SPEC.md §12-§14).
+pub fn run(repo: Repository, initial_view: InitialView) -> i32 {
     let app = adw::Application::builder().application_id(APP_ID).build();
 
     app.set_accels_for_action("win.refresh", &["<Primary>r"]);
@@ -88,7 +90,8 @@ pub fn run(repo: Repository) -> i32 {
         let slot = window_slot.clone();
         app.connect_activate(move |app| {
             let mut slot = slot.borrow_mut();
-            let window = slot.get_or_insert_with(|| MainWindow::new(app, repo.clone()));
+            let window = slot
+                .get_or_insert_with(|| MainWindow::new(app, repo.clone(), initial_view.clone()));
             window.present();
         });
     }

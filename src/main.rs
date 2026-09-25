@@ -1,21 +1,23 @@
 //! `gitilante` command line entry point.
 //!
 //! Usage: `gitilante [path]` opens the repository containing `path` (default:
-//! the current directory) in the GUI.
+//! the current directory) in the GUI; a file path opens its File History
+//! (GITILANTE_CLI_FILE_HISTORY_SPEC.md).
 
 use std::env;
 use std::ffi::OsString;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
+use gitilante::cli;
 use gitilante::git::Error;
-use gitilante::git::repository::Repository;
 use gitilante::ui;
 
 const USAGE: &str = "\
 Usage: gitilante [path]
 
-Opens the Git repository containing <path> (any subdirectory is accepted).
+If <path> is a directory, opens the Git repository containing it.
+If <path> is a file, opens that file's history in its containing repository.
 When <path> is omitted, the current directory is used.
 
 Options:
@@ -59,12 +61,12 @@ fn main() -> ExitCode {
         }
     };
 
-    let repo = match Repository::discover(&path) {
-        Ok(repo) => repo,
+    let (repo, initial_view) = match cli::resolve_open_target(&path) {
+        Ok(targets) => targets,
         Err(error) => return report(&error),
     };
 
-    ExitCode::from(ui::app::run(repo) as u8)
+    ExitCode::from(ui::app::run(repo, initial_view) as u8)
 }
 
 /// Parses the command line.
@@ -104,4 +106,39 @@ fn report(error: &Error) -> ExitCode {
         log::debug!("{}", git_error.details());
     }
     ExitCode::FAILURE
+}
+
+#[cfg(test)]
+mod args_tests {
+    use super::*;
+    use std::path::Path;
+
+    fn args(items: &[&str]) -> Result<Args, String> {
+        parse_args(items.iter().map(OsString::from))
+    }
+
+    #[test]
+    fn options_and_default_are_unchanged() {
+        assert!(matches!(args(&["-h"]), Ok(Args::ShowHelp)));
+        assert!(matches!(args(&["--help"]), Ok(Args::ShowHelp)));
+        assert!(matches!(args(&["-V"]), Ok(Args::ShowVersion)));
+        assert!(matches!(args(&["--version"]), Ok(Args::ShowVersion)));
+        assert!(args(&["-x"]).is_err());
+        assert!(matches!(args(&[]), Ok(Args::Open(path)) if path.as_path() == Path::new(".")));
+    }
+
+    #[test]
+    fn double_dash_keeps_leading_dash_paths() {
+        assert!(
+            matches!(args(&["--", "-leading.rs"]), Ok(Args::Open(path)) if path.as_path() == Path::new("-leading.rs"))
+        );
+    }
+
+    #[test]
+    fn multiple_paths_are_rejected() {
+        assert!(matches!(
+            args(&["a.rs", "b.rs"]),
+            Err(message) if message == "too many paths given"
+        ));
+    }
 }
