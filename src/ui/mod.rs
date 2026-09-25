@@ -12,6 +12,7 @@ pub mod history;
 pub mod main_window;
 pub mod search;
 pub mod search_dialog;
+pub mod splitting;
 pub mod worker;
 
 use std::path::{Path, PathBuf};

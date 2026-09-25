@@ -6,6 +6,7 @@
 //! deletions keep their `+`/`-` markers and get a light background tint.
 
 use std::cell::RefCell;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
@@ -19,6 +20,7 @@ use sourceview5::Language;
 
 use crate::syntax::Highlighter;
 
+use crate::hunk_split;
 use crate::model::diff::{DiffLineKind, DiffStats, FileDiff, Hunk};
 use crate::ui::clipboard::{self, CopyAction};
 use crate::ui::folding::{DiffFoldState, FileFoldKey, FoldFocus, HunkFoldKey};
@@ -58,8 +60,10 @@ pub struct Callbacks {
     pub preview_history: Box<dyn Fn(PathBuf)>,
     /// Toggle the folding of a file (GITILANTE_DIFF_FOLDING_SPEC.md §23).
     pub toggle_file: Box<dyn Fn(FileFoldKey)>,
-    /// Toggle the folding of a hunk.
+    /// Toggle the folding of a presented hunk.
     pub toggle_hunk: Box<dyn Fn(HunkFoldKey)>,
+    /// Split or unsplit an original Git hunk.
+    pub toggle_split: Box<dyn Fn(HunkFoldKey)>,
 }
 
 /// One piece of searchable rendered text: the buffer of a hunk body holds
@@ -69,9 +73,12 @@ pub struct Callbacks {
 pub struct SearchTarget {
     pub buffer: TextBuffer,
     pub view: TextView,
-    /// The hunk this target belongs to, for the search navigation
-    /// (GITILANTE_DIFF_FOLDING_SPEC.md section 30).
+    /// The rendered hunk this target belongs to (may be a synthetic child).
     pub hunk: Option<HunkFoldKey>,
+    /// Original Git hunk and its source-line range, for global navigation.
+    pub origin_hunk: Option<HunkFoldKey>,
+    pub source_start: usize,
+    pub source_end: usize,
 }
 
 /// A rendered diff: its widget and its searchable text (one per hunk body).
@@ -96,6 +103,7 @@ pub fn render(
     side: DiffSide,
     highlighter: &Highlighter,
     folds: &DiffFoldState,
+    split_hunks: &HashSet<HunkFoldKey>,
     focus: Option<&FoldFocus>,
     callbacks: &Rc<Callbacks>,
 ) -> RenderedDiff {
@@ -137,20 +145,49 @@ pub fn render(
         }
     } else {
         for hunk in &file.hunks {
-            let hunk_key = HunkFoldKey::from_hunk(file, hunk);
-            let (widget, target) = hunk_view(
-                file,
-                hunk,
-                side,
-                language.as_ref(),
-                highlighter,
-                folds.is_hunk_collapsed(&hunk_key),
-                focus,
-                callbacks,
-            );
-            root.append(&widget);
-            if let Some(target) = target {
-                targets.push(target);
+            let origin_key = HunkFoldKey::from_hunk(file, hunk);
+            let parts = split_hunks
+                .contains(&origin_key)
+                .then(|| hunk_split::split(file, hunk))
+                .flatten();
+            if let Some(parts) = parts {
+                for part in parts {
+                    append_hunk(
+                        &root,
+                        &mut targets,
+                        file,
+                        &part.hunk,
+                        &origin_key,
+                        part.source_start,
+                        part.source_end,
+                        Some((part.index, part.total)),
+                        true,
+                        side,
+                        language.as_ref(),
+                        highlighter,
+                        folds,
+                        focus,
+                        callbacks,
+                    );
+                }
+            } else {
+                append_hunk(
+                    &root,
+                    &mut targets,
+                    file,
+                    hunk,
+                    &origin_key,
+                    0,
+                    hunk.lines.len(),
+                    None,
+                    false,
+                    side,
+                    language.as_ref(),
+                    highlighter,
+                    folds,
+                    focus,
+                    callbacks,
+                );
             }
         }
     }
@@ -335,6 +372,9 @@ pub fn render_file_preview(
         buffer,
         view: body,
         hunk: None,
+        origin_hunk: None,
+        source_start: 0,
+        source_end: 0,
     };
     RenderedDiff {
         widget: root.upcast(),
@@ -509,11 +549,56 @@ fn file_header(
 }
 
 /// One hunk block: header with actions, then the hunk body.
+#[allow(clippy::too_many_arguments)]
+fn append_hunk(
+    root: &GtkBox,
+    targets: &mut Vec<SearchTarget>,
+    file: &FileDiff,
+    hunk: &Hunk,
+    origin_key: &HunkFoldKey,
+    source_start: usize,
+    source_end: usize,
+    split_label: Option<(usize, usize)>,
+    is_split: bool,
+    side: DiffSide,
+    language: Option<&Language>,
+    highlighter: &Highlighter,
+    folds: &DiffFoldState,
+    focus: Option<&FoldFocus>,
+    callbacks: &Rc<Callbacks>,
+) {
+    let child_key = HunkFoldKey::from_hunk(file, hunk);
+    let (widget, target) = hunk_view(
+        file,
+        hunk,
+        origin_key,
+        source_start,
+        source_end,
+        split_label,
+        is_split,
+        side,
+        language,
+        highlighter,
+        folds.is_hunk_collapsed(&child_key),
+        focus,
+        callbacks,
+    );
+    root.append(&widget);
+    if let Some(target) = target {
+        targets.push(target);
+    }
+}
+
 /// One hunk: its collapsible header and, when expanded, its body.
 #[allow(clippy::too_many_arguments)]
 fn hunk_view(
     file: &FileDiff,
     hunk: &Hunk,
+    origin_key: &HunkFoldKey,
+    source_start: usize,
+    source_end: usize,
+    split_label: Option<(usize, usize)>,
+    is_split: bool,
     side: DiffSide,
     language: Option<&Language>,
     highlighter: &Highlighter,
@@ -556,6 +641,12 @@ fn hunk_view(
     header.append(&header_label);
 
     header.append(&stats_label(hunk.stats()));
+    if let Some((index, total)) = split_label {
+        let label = Label::new(Some(&format!("split {index}/{total}")));
+        label.add_css_class("dim-label");
+        label.add_css_class("caption");
+        header.append(&label);
+    }
 
     match side {
         DiffSide::Staged => {
@@ -620,18 +711,30 @@ fn hunk_view(
         DiffSide::Conflicted => {}
     }
     if !matches!(side, DiffSide::Conflicted) {
+        let mut actions: Vec<clipboard::MenuAction> = Vec::new();
+        if is_split {
+            let callbacks = callbacks.clone();
+            let origin_key = origin_key.clone();
+            actions.push((
+                "Unsplit hunk",
+                Box::new(move || (callbacks.toggle_split)(origin_key.clone())),
+            ));
+        } else if hunk_split::can_split(file, hunk) {
+            let callbacks = callbacks.clone();
+            let origin_key = origin_key.clone();
+            actions.push((
+                "Split hunk",
+                Box::new(move || (callbacks.toggle_split)(origin_key.clone())),
+            ));
+        }
         let file = file.clone();
         let hunk = hunk.clone();
         let callbacks = callbacks.clone();
-        clipboard::context_menu(
-            &header,
-            vec![(
-                "Copy hunk diff",
-                Box::new(move || {
-                    (callbacks.copy)(CopyAction::HunkDiff(file.clone(), hunk.clone()));
-                }),
-            )],
-        );
+        actions.push((
+            "Copy hunk diff",
+            Box::new(move || (callbacks.copy)(CopyAction::HunkDiff(file.clone(), hunk.clone()))),
+        ));
+        clipboard::context_menu(&header, actions);
     }
     block.append(&header);
 
@@ -643,6 +746,9 @@ fn hunk_view(
 
     let (body, mut search_target) = hunk_body(hunk, language, highlighter);
     search_target.hunk = Some(key);
+    search_target.origin_hunk = Some(origin_key.clone());
+    search_target.source_start = source_start;
+    search_target.source_end = source_end;
     track_focus(&body, &target, callbacks);
     if matches!(side, DiffSide::Staged | DiffSide::Unstaged)
         && crate::git::patch::supports_selected_lines(file, hunk)
@@ -937,6 +1043,9 @@ fn hunk_body(
         buffer,
         view: body,
         hunk: None,
+        origin_hunk: None,
+        source_start: 0,
+        source_end: 0,
     };
     (box_.upcast(), search_target)
 }

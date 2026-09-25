@@ -8,7 +8,7 @@
 //! - reports errors with toasts, reserving dialogs for decisions (discard).
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::{Rc, Weak};
 
@@ -37,7 +37,7 @@ use crate::search::result::{
 use crate::ui::worker::Worker;
 use crate::ui::{
     DiffSide, HunkTarget, Selection, changes, clipboard, conflict_view, diff_view, external_editor,
-    folding, history, search, search_dialog, short_path,
+    folding, history, search, search_dialog, short_path, splitting,
 };
 
 /// Commits per history block (SPEC section 16).
@@ -143,6 +143,8 @@ struct Inner {
     highlighter: crate::syntax::Highlighter,
     /// Folding state of the rendered diffs (GITILANTE_DIFF_FOLDING_SPEC.md §15).
     folds: RefCell<folding::FoldStateStore>,
+    /// Presentation-only split state, keyed by rendered document and raw hunk.
+    splits: RefCell<splitting::SplitStateStore>,
     /// Disclosure to focus after a folding toggle (section 26).
     pending_focus: Cell<Option<folding::FoldFocus>>,
     /// Menu button whose model swaps between diff and conflict folding (§68).
@@ -511,6 +513,7 @@ impl Inner {
             busy: Cell::new(0),
             highlighter: crate::syntax::Highlighter::new(),
             folds: RefCell::new(folding::FoldStateStore::default()),
+            splits: RefCell::new(splitting::SplitStateStore::default()),
             pending_focus: Cell::new(None),
             fold_button,
             conflict_fold_menu_active: Cell::new(false),
@@ -1327,15 +1330,15 @@ impl Inner {
     /// Flashes the first match of the pending query on the added/removed lines
     /// of the freshly rendered commit diff (GITILANTE_SEARCH_SPEC.md §30).
     fn flash_commit_matches(&self) {
-        let (query, diff, targets) = {
+        let (query, oid, diff, mut targets) = {
             let mut state = self.state.borrow_mut();
             let Some(query) = state.commit_flash.take() else {
                 return;
             };
-            let Some((_, diff)) = state.commit_diff.clone() else {
+            let Some((oid, diff)) = state.commit_diff.clone() else {
                 return;
             };
-            (query, diff, state.render_targets.clone())
+            (query, oid, diff, state.render_targets.clone())
         };
         let case_sensitive = query.is_case_sensitive();
         let mut found = None;
@@ -1355,63 +1358,54 @@ impl Inner {
                     if ranges.is_empty() {
                         continue;
                     }
-                    found = Some((
-                        folding::HunkFoldKey::from_hunk(file, hunk),
-                        line_index,
-                        ranges,
-                    ));
+                    found = Some((file.clone(), hunk.clone(), line_index, ranges));
                     break 'search;
                 }
             }
         }
-        let Some((key, line_index, ranges)) = found else {
+        let Some((file, hunk, source_line, ranges)) = found else {
             return;
         };
-        // Reveal the parents when the match is inside collapsed content
-        // (GITILANTE_DIFF_FOLDING_SPEC.md sections 30-31).
-        let mut targets = targets;
-        if !targets
-            .iter()
-            .any(|target| target.hunk.as_ref() == Some(&key))
-        {
-            let document = {
-                let state = self.state.borrow();
-                state
-                    .selection
-                    .as_ref()
-                    .and_then(folding::DiffDocumentKey::from_selection)
-            };
-            if let Some(document) = document {
-                self.folds
-                    .borrow_mut()
-                    .for_document(&document)
-                    .reveal_key(&key);
-            }
-            self.rerender_diff();
-            targets = self.state.borrow().render_targets.clone();
-        }
-        let Some(target) = targets
-            .iter()
-            .find(|target| target.hunk.as_ref() == Some(&key))
+        let origin_key = folding::HunkFoldKey::from_hunk(&file, &hunk);
+        let document = folding::DiffDocumentKey::Commit(oid);
+        let split_keys = self.splits.borrow().keys(&document);
+        let Some((_, shown_key, child_line)) =
+            map_source_line(&file, &hunk, source_line, &split_keys)
         else {
             return;
         };
-        // Flash this match and stop: Ctrl+F walks the rest.
+        if !targets.iter().any(|target| {
+            target.origin_hunk.as_ref() == Some(&origin_key)
+                && (target.source_start..target.source_end).contains(&source_line)
+        }) {
+            self.folds
+                .borrow_mut()
+                .for_document(&document)
+                .reveal_key(&shown_key);
+            self.rerender_diff();
+            targets = self.state.borrow().render_targets.clone();
+        }
+        let Some(target) = targets.iter().find(|target| {
+            target.origin_hunk.as_ref() == Some(&origin_key)
+                && (target.source_start..target.source_end).contains(&source_line)
+        }) else {
+            return;
+        };
         let flash_tag = search::flash_tag(&target.buffer);
         for (start, end) in ranges {
             let (Some(from), Some(to)) = (
                 target
                     .buffer
-                    .iter_at_line_offset(line_index as i32, start as i32),
+                    .iter_at_line_offset(child_line as i32, start as i32),
                 target
                     .buffer
-                    .iter_at_line_offset(line_index as i32, end as i32),
+                    .iter_at_line_offset(child_line as i32, end as i32),
             ) else {
                 continue;
             };
             target.buffer.apply_tag(&flash_tag, &from, &to);
         }
-        if let Some(iter) = target.buffer.iter_at_line_offset(line_index as i32, 0) {
+        if let Some(iter) = target.buffer.iter_at_line_offset(child_line as i32, 0) {
             search::reveal_iter(&self.diff_scroll, target, &iter);
         }
         let buffer = target.buffer.clone();
@@ -1442,6 +1436,20 @@ impl Inner {
         self.with_fold_state(focus, |state| state.toggle_hunk(key));
     }
 
+    /// Toggles split presentation without invoking Git or refreshing state.
+    fn toggle_hunk_split(&self, key: folding::HunkFoldKey) {
+        let document = {
+            let state = self.state.borrow();
+            state
+                .selection
+                .as_ref()
+                .and_then(folding::DiffDocumentKey::from_selection)
+        };
+        let Some(document) = document else { return };
+        self.splits.borrow_mut().toggle(&document, key);
+        self.rerender_diff();
+    }
+
     fn with_fold_state(
         &self,
         focus: folding::FoldFocus,
@@ -1468,10 +1476,12 @@ impl Inner {
         let Some((document, diff)) = self.current_document() else {
             return;
         };
+        let split_keys = self.splits.borrow().keys(&document);
+        let presented = diff_with_split_parts(&diff, &split_keys, false);
         self.folds
             .borrow_mut()
             .for_document(&document)
-            .apply(action, &diff);
+            .apply(action, &presented);
         self.rerender_diff();
     }
 
@@ -1522,6 +1532,7 @@ impl Inner {
             return;
         };
         let case_sensitive = crate::search::matcher::is_case_sensitive(query);
+        let split_keys = self.splits.borrow().keys(&document);
         let mut revealed = false;
         {
             let mut store = self.folds.borrow_mut();
@@ -1529,17 +1540,50 @@ impl Inner {
             for file in &diff.files {
                 let file_key = folding::FileFoldKey::from_file(file);
                 for hunk in &file.hunks {
-                    let hunk_key = folding::HunkFoldKey::from_hunk(file, hunk);
-                    if !state.is_file_collapsed(&file_key) && !state.is_hunk_collapsed(&hunk_key) {
-                        continue;
-                    }
-                    let hit = hunk.lines.iter().any(|line| {
-                        !crate::search::matcher::find_matches(&line.text(), query, case_sensitive)
+                    let origin_key = folding::HunkFoldKey::from_hunk(file, hunk);
+                    let parts = split_keys
+                        .contains(&origin_key)
+                        .then(|| crate::hunk_split::split(file, hunk))
+                        .flatten();
+                    if let Some(parts) = parts {
+                        for part in parts {
+                            let child_key = folding::HunkFoldKey::from_hunk(file, &part.hunk);
+                            if !state.is_file_collapsed(&file_key)
+                                && !state.is_hunk_collapsed(&child_key)
+                            {
+                                continue;
+                            }
+                            let hit = part.hunk.lines.iter().any(|line| {
+                                !crate::search::matcher::find_matches(
+                                    &line.text(),
+                                    query,
+                                    case_sensitive,
+                                )
+                                .is_empty()
+                            });
+                            if hit {
+                                state.reveal_key(&child_key);
+                                revealed = true;
+                            }
+                        }
+                    } else {
+                        if !state.is_file_collapsed(&file_key)
+                            && !state.is_hunk_collapsed(&origin_key)
+                        {
+                            continue;
+                        }
+                        let hit = hunk.lines.iter().any(|line| {
+                            !crate::search::matcher::find_matches(
+                                &line.text(),
+                                query,
+                                case_sensitive,
+                            )
                             .is_empty()
-                    });
-                    if hit {
-                        state.reveal_key(&hunk_key);
-                        revealed = true;
+                        });
+                        if hit {
+                            state.reveal_key(&origin_key);
+                            revealed = true;
+                        }
                     }
                 }
             }
@@ -1576,9 +1620,7 @@ impl Inner {
 
     fn navigate_to_change(&self, result: &ChangeSearchResult) {
         self.search_dialog.close();
-        // Reveal the target even when it is collapsed
-        // (GITILANTE_DIFF_FOLDING_SPEC.md sections 30-31).
-        let hunk_key = {
+        let located = {
             let state = self.state.borrow();
             let side = state.data.as_ref().map(|data| match result.side {
                 DiffSide::Staged => &data.staged,
@@ -1588,47 +1630,54 @@ impl Inner {
                 .and_then(|file| {
                     file.hunks
                         .get(result.hunk_index)
-                        .map(|hunk| folding::HunkFoldKey::from_hunk(file, hunk))
+                        .map(|hunk| (file.clone(), hunk.clone()))
                 })
         };
-        if let (Some(key), Some(document)) = (
-            hunk_key.as_ref(),
-            folding::document_key_for_file(result.side, &result.path),
-        ) {
+        let document = folding::document_key_for_file(result.side, &result.path);
+        let mapped = located.as_ref().and_then(|(file, hunk)| {
+            let split_keys = document
+                .as_ref()
+                .map(|document| self.splits.borrow().keys(document))
+                .unwrap_or_default();
+            map_source_line(file, hunk, result.line_index, &split_keys)
+        });
+        if let (Some((_, shown_key, _)), Some(document)) = (mapped.as_ref(), document.as_ref()) {
             self.folds
                 .borrow_mut()
-                .for_document(&document)
-                .reveal_key(key);
+                .for_document(document)
+                .reveal_key(shown_key);
         }
         let selection = match result.side {
             DiffSide::Staged => Selection::Staged(result.path.clone()),
             _ => Selection::Unstaged(result.path.clone()),
         };
         self.select(selection);
-        // Mark the file in the Changes sidebar too.
         self.render_changes();
 
-        // Scroll to the matched line and flash it briefly (section 12).
+        let Some((origin_key, _, child_line)) = mapped else {
+            return;
+        };
         let target = {
             let state = self.state.borrow();
             state
                 .render_targets
                 .iter()
-                .find(|target| target.hunk == hunk_key)
+                .find(|target| {
+                    target.origin_hunk.as_ref() == Some(&origin_key)
+                        && (target.source_start..target.source_end).contains(&result.line_index)
+                })
                 .cloned()
         };
-        let Some(target) = target else {
-            return;
-        };
+        let Some(target) = target else { return };
         let flash = search::flash_tag(&target.buffer);
         for range in &result.match_ranges {
             let (Some(start), Some(end)) = (
                 target
                     .buffer
-                    .iter_at_line_offset(result.line_index as i32, range.start as i32),
+                    .iter_at_line_offset(child_line as i32, range.start as i32),
                 target
                     .buffer
-                    .iter_at_line_offset(result.line_index as i32, range.end as i32),
+                    .iter_at_line_offset(child_line as i32, range.end as i32),
             ) else {
                 continue;
             };
@@ -1639,10 +1688,7 @@ impl Inner {
             .first()
             .map(|range| range.start as i32)
             .unwrap_or(0);
-        if let Some(iter) = target
-            .buffer
-            .iter_at_line_offset(result.line_index as i32, offset)
-        {
+        if let Some(iter) = target.buffer.iter_at_line_offset(child_line as i32, offset) {
             search::reveal_iter(&self.diff_scroll, &target, &iter);
         }
         gtk4::glib::timeout_add_local_once(std::time::Duration::from_millis(1400), move || {
@@ -1807,25 +1853,33 @@ impl Inner {
     ) -> diff_view::RenderedDiff {
         match find_file(diff, path) {
             Some(file) => {
-                // The fold state lives outside the Git model and survives
-                // refreshes best-effort (GITILANTE_DIFF_FOLDING_SPEC.md
-                // sections 11 and 14).
+                let document = folding::document_key_for_file(side, path);
+                let split_keys = if let Some(document) = &document {
+                    let mut splits = self.splits.borrow_mut();
+                    splits.prune(document, diff);
+                    splits.keys(document)
+                } else {
+                    HashSet::new()
+                };
+                // Keep original fold keys while split and add child keys so
+                // child fold state survives rerenders (spec §30, §39).
+                let fold_live_diff = diff_with_split_parts(diff, &split_keys, true);
                 let mut store = self.folds.borrow_mut();
                 let empty = folding::DiffFoldState::default();
-                let folds: &folding::DiffFoldState =
-                    match folding::document_key_for_file(side, path) {
-                        Some(key) => {
-                            let state = store.for_document(&key);
-                            state.prune(diff);
-                            state
-                        }
-                        None => &empty,
-                    };
+                let folds: &folding::DiffFoldState = match document {
+                    Some(key) => {
+                        let state = store.for_document(&key);
+                        state.prune(&fold_live_diff);
+                        state
+                    }
+                    None => &empty,
+                };
                 diff_view::render(
                     file,
                     side,
                     &self.highlighter,
                     folds,
+                    &split_keys,
                     focus,
                     &self.diff_callbacks(),
                 )
@@ -1915,10 +1969,16 @@ impl Inner {
                 "No changes in this commit",
             ));
         }
-        let mut store = self.folds.borrow_mut();
         let key = folding::DiffDocumentKey::Commit(oid.to_owned());
+        let split_keys = {
+            let mut splits = self.splits.borrow_mut();
+            splits.prune(&key, diff);
+            splits.keys(&key)
+        };
+        let fold_live_diff = diff_with_split_parts(diff, &split_keys, true);
+        let mut store = self.folds.borrow_mut();
         let folds = store.for_document(&key);
-        folds.prune(diff);
+        folds.prune(&fold_live_diff);
         let box_ = GtkBox::new(Orientation::Vertical, 24);
         let mut targets = Vec::new();
         for file in &diff.files {
@@ -1934,6 +1994,7 @@ impl Inner {
                 DiffSide::History,
                 &self.highlighter,
                 folds,
+                &split_keys,
                 focus,
                 &self.diff_callbacks(),
             );
@@ -2010,6 +2071,14 @@ impl Inner {
                 Box::new(move |key| {
                     if let Some(inner) = weak.upgrade() {
                         inner.toggle_hunk_fold(key);
+                    }
+                })
+            },
+            toggle_split: {
+                let weak = weak.clone();
+                Box::new(move |key| {
+                    if let Some(inner) = weak.upgrade() {
+                        inner.toggle_hunk_split(key);
                     }
                 })
             },
@@ -2380,6 +2449,55 @@ fn take_pending_after_refresh(pending: &mut Option<PathBuf>, refresh_ok: bool) -
     if refresh_ok { pending.take() } else { None }
 }
 
+/// Maps a raw global-search line index to the rendered hunk child (if split)
+/// and its local line index.
+fn map_source_line(
+    file: &FileDiff,
+    hunk: &Hunk,
+    source_line: usize,
+    split_keys: &HashSet<folding::HunkFoldKey>,
+) -> Option<(folding::HunkFoldKey, folding::HunkFoldKey, usize)> {
+    let origin_key = folding::HunkFoldKey::from_hunk(file, hunk);
+    if split_keys.contains(&origin_key) {
+        let part = crate::hunk_split::split(file, hunk)?
+            .into_iter()
+            .find(|part| (part.source_start..part.source_end).contains(&source_line))?;
+        let shown_key = folding::HunkFoldKey::from_hunk(file, &part.hunk);
+        Some((origin_key, shown_key, source_line - part.source_start))
+    } else {
+        Some((origin_key.clone(), origin_key, source_line))
+    }
+}
+
+/// Derives a diff containing the currently presented hunks. When
+/// `retain_original` is true, raw keys are included too for fold-state pruning.
+fn diff_with_split_parts(
+    diff: &Diff,
+    split_keys: &HashSet<folding::HunkFoldKey>,
+    retain_original: bool,
+) -> Diff {
+    let mut presented = diff.clone();
+    for file in &mut presented.files {
+        let original = std::mem::take(&mut file.hunks);
+        for hunk in original {
+            let key = folding::HunkFoldKey::from_hunk(file, &hunk);
+            let parts = split_keys
+                .contains(&key)
+                .then(|| crate::hunk_split::split(file, &hunk))
+                .flatten();
+            if let Some(parts) = parts {
+                if retain_original {
+                    file.hunks.push(hunk);
+                }
+                file.hunks.extend(parts.into_iter().map(|part| part.hunk));
+            } else {
+                file.hunks.push(hunk);
+            }
+        }
+    }
+    presented
+}
+
 fn subtitle_text(root: &Path, status: &Status) -> String {
     use crate::model::status::Head;
     let branch = match &status.branch.head {
@@ -2420,6 +2538,79 @@ fn toast_message(error: &Error) -> String {
             .next()
             .unwrap_or("Unknown error")
             .to_owned(),
+    }
+}
+
+#[cfg(test)]
+mod split_navigation_tests {
+    use super::*;
+    use crate::model::diff::{DiffLine, DiffLineKind, FileStatus};
+
+    fn line(kind: DiffLineKind, content: &[u8]) -> DiffLine {
+        DiffLine {
+            kind,
+            content: content.to_vec(),
+            intraline: Vec::new(),
+        }
+    }
+
+    fn source_diff() -> FileDiff {
+        let lines = vec![
+            line(DiffLineKind::Context, b"before\n"),
+            line(DiffLineKind::Deletion, b"old A\n"),
+            line(DiffLineKind::Addition, b"new A\n"),
+            line(DiffLineKind::Context, b"between\n"),
+            line(DiffLineKind::Deletion, b"old B\n"),
+            line(DiffLineKind::Addition, b"new B\n"),
+            line(DiffLineKind::Context, b"after\n"),
+        ];
+        FileDiff {
+            header: b"diff --git a/file.rs b/file.rs".to_vec(),
+            metadata: Vec::new(),
+            old_path: Some(PathBuf::from("file.rs")),
+            new_path: Some(PathBuf::from("file.rs")),
+            status: FileStatus::Modified,
+            binary: false,
+            hunks: vec![Hunk {
+                old_start: 1,
+                old_count: 6,
+                new_start: 1,
+                new_count: 6,
+                header: b"@@ -1,6 +1,6 @@".to_vec(),
+                lines,
+            }],
+        }
+    }
+
+    #[test]
+    fn global_changed_line_maps_to_its_split_child_and_local_line() {
+        let file = source_diff();
+        let original = &file.hunks[0];
+        let origin = folding::HunkFoldKey::from_hunk(&file, original);
+        let split_keys = HashSet::from([origin]);
+        let mapped = map_source_line(&file, original, 5, &split_keys).unwrap();
+        let parts = crate::hunk_split::split(&file, original).unwrap();
+        assert_eq!(mapped.0, folding::HunkFoldKey::from_hunk(&file, original));
+        assert_eq!(
+            mapped.1,
+            folding::HunkFoldKey::from_hunk(&file, &parts[1].hunk)
+        );
+        assert_eq!(mapped.2, 2);
+    }
+
+    #[test]
+    fn presented_diff_exposes_children_but_retains_original_for_pruning() {
+        let file = source_diff();
+        let raw = Diff {
+            files: vec![file.clone()],
+        };
+        let origin = folding::HunkFoldKey::from_hunk(&file, &file.hunks[0]);
+        let split_keys = HashSet::from([origin]);
+        let presented = diff_with_split_parts(&raw, &split_keys, false);
+        let fold_live = diff_with_split_parts(&raw, &split_keys, true);
+        assert_eq!(presented.files[0].hunks.len(), 2);
+        assert_eq!(fold_live.files[0].hunks.len(), 3);
+        assert_eq!(raw.files[0].hunks.len(), 1);
     }
 }
 

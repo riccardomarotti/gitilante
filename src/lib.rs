@@ -7,6 +7,7 @@ pub mod cli;
 pub mod conflict;
 pub mod git;
 pub mod graph;
+pub mod hunk_split;
 pub mod intraline;
 pub mod model;
 pub mod search;

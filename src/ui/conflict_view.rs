@@ -554,6 +554,9 @@ fn source_panel(
         buffer,
         view,
         hunk: None,
+        origin_hunk: None,
+        source_start: 0,
+        source_end: 0,
     };
     (root.upcast(), target)
 }
@@ -602,6 +605,9 @@ fn result_panel(
             buffer: buffer.upcast(),
             view: view.clone(),
             hunk: None,
+            origin_hunk: None,
+            source_start: 0,
+            source_end: 0,
         },
     )
 }
