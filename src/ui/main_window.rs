@@ -40,6 +40,25 @@ use crate::ui::{
     folding, history, search, search_dialog, short_path, splitting,
 };
 
+/// Prefer the content's natural width without giving the sidebar more than
+/// 40% of the initial window. Subsequent resizes remain user-controlled.
+fn initial_sidebar_width(natural: i32, window_width: i32) -> i32 {
+    natural.clamp(280, (window_width * 2 / 5).max(280))
+}
+
+#[cfg(test)]
+mod sidebar_width_tests {
+    use super::initial_sidebar_width;
+
+    #[test]
+    fn content_width_is_bounded() {
+        assert_eq!(initial_sidebar_width(100, 1200), 280);
+        assert_eq!(initial_sidebar_width(390, 1200), 390);
+        assert_eq!(initial_sidebar_width(2000, 1200), 480);
+        assert_eq!(initial_sidebar_width(2000, 600), 280);
+    }
+}
+
 /// Commits per history block (SPEC section 16).
 const HISTORY_PAGE: usize = 200;
 
@@ -170,6 +189,9 @@ struct Inner {
     diff_scroll: ScrolledWindow,
     /// Sidebar scroll, anchored across History rebuilds.
     sidebar_adjustment: Adjustment,
+    sidebar: GtkBox,
+    paned: Paned,
+    initial_sidebar_sized: Cell<bool>,
 }
 
 /// The Gitilante main window.
@@ -531,6 +553,9 @@ impl Inner {
             diff_box,
             diff_scroll,
             sidebar_adjustment: sidebar_scroll.vadjustment(),
+            sidebar,
+            paned,
+            initial_sidebar_sized: Cell::new(false),
         }
     }
 
@@ -1746,6 +1771,17 @@ impl Inner {
                 HistoryMode::File { display_path, .. } => Some(display_path.as_path()),
             },
         );
+        if (!commits.is_empty() || exhausted) && !self.initial_sidebar_sized.replace(true) {
+            let weak = self.self_weak.clone();
+            gtk4::glib::idle_add_local_once(move || {
+                if let Some(inner) = weak.upgrade() {
+                    let (_, natural, _, _) = inner.sidebar.measure(Orientation::Horizontal, -1);
+                    inner
+                        .paned
+                        .set_position(initial_sidebar_width(natural, inner.window.width()));
+                }
+            });
+        }
         gtk4::glib::idle_add_local_once(move || {
             adjustment.set_value(anchor);
         });
