@@ -250,8 +250,8 @@ impl HistoryView {
         subject.set_hexpand(true);
         subject.set_ellipsize(pango::EllipsizeMode::End);
         title.append(&subject);
-        push_badges(&title, commit, refs, head);
         box_.append(&title);
+        push_badges(&box_, commit, refs, head);
 
         let detail = Label::new(Some(&format!(
             "{} · {}",
@@ -319,7 +319,7 @@ impl HistoryView {
     }
 }
 
-/// Appends the ref badges of a commit to its title row
+/// Appends wrapping ref badges below the commit title
 /// (BRANCH.md sections 39-42).
 fn push_badges(
     title: &GtkBox,
@@ -327,10 +327,19 @@ fn push_badges(
     refs: &HashMap<String, Vec<CommitRef>>,
     head: Option<&HeadRef>,
 ) {
+    let badges = gtk4::FlowBox::new();
+    badges.set_selection_mode(SelectionMode::None);
+    badges.set_min_children_per_line(1);
+    badges.set_max_children_per_line(100);
+    badges.set_row_spacing(2);
+    badges.set_column_spacing(4);
     let none = Vec::new();
     for commit_ref in refs.get(&commit.oid).unwrap_or(&none) {
         let label = Label::new(Some(&commit_ref.name));
         label.add_css_class("ref-badge");
+        label.set_ellipsize(pango::EllipsizeMode::End);
+        label.set_max_width_chars(24);
+        label.set_tooltip_text(Some(&commit_ref.name));
         label.add_css_class(match commit_ref.kind {
             RefKind::LocalBranch => "ref-local",
             RefKind::RemoteBranch => "ref-remote",
@@ -341,7 +350,7 @@ fn push_badges(
         {
             label.add_css_class("ref-current");
         }
-        title.append(&label);
+        badges.insert(&label, -1);
     }
     // A detached HEAD is shown explicitly on its commit (BRANCH.md section 11).
     if let Some(head) = head {
@@ -349,8 +358,11 @@ fn push_badges(
             let label = Label::new(Some("HEAD"));
             label.add_css_class("ref-badge");
             label.add_css_class("ref-head");
-            title.append(&label);
+            badges.insert(&label, -1);
         }
+    }
+    if badges.first_child().is_some() {
+        title.append(&badges);
     }
 }
 
