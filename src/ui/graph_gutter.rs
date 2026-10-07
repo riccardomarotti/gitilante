@@ -1,15 +1,18 @@
 //! Graph gutter rendering for the History (BRANCH.md sections 32-38).
 //!
-//! Each History row owns a [`gtk4::DrawingArea`] that draws the commit node and
-//! the lane segments prepared by the layout engine (BRANCH.md section 53: the
-//! draw callback never computes the DAG). Lanes keep a constant width and the
-//! gutter is as wide as the widest row (BRANCH.md section 68).
+//! The whole repository History graph is rendered by one overlaid
+//! [`gtk4::DrawingArea`]. Commit rows only reserve the gutter width. Drawing
+//! all lanes in a single Cairo surface removes rasterization seams at ListBox
+//! row boundaries while keeping the pure DAG layout in [`crate::graph`].
 
-use gtk4::DrawingArea;
+use std::cell::{Cell, RefCell};
+use std::rc::Rc;
+
 use gtk4::cairo::{self, LineCap, LineJoin};
 use gtk4::prelude::*;
+use gtk4::{Align, DrawingArea, ListBox};
 
-use crate::graph::{GraphNodeKind, GraphPoint, GraphRow};
+use crate::graph::{GraphNodeKind, GraphPoint, HistoryGraph};
 
 /// Horizontal distance between two lanes (BRANCH.md section 34).
 const LANE_WIDTH: f64 = 16.0;
@@ -17,11 +20,6 @@ const LANE_WIDTH: f64 = 16.0;
 const NODE_RADIUS: f64 = 4.0;
 /// Width of the lane segments (BRANCH.md section 34).
 const EDGE_WIDTH: f64 = 2.0;
-/// Extend row-to-row edges beyond the DrawingArea clip. Each History row is
-/// rasterized independently; ending a stroked path exactly on the clip boundary
-/// can leave a one-pixel antialias seam even with square caps. Overdrawing keeps
-/// the boundary in the middle of the stroke, then GTK clips it flush.
-const EDGE_OVERDRAW: f64 = EDGE_WIDTH;
 /// Padding around the lanes (BRANCH.md section 34).
 const GUTTER_PADDING: f64 = 6.0;
 
@@ -51,135 +49,249 @@ const PALETTE_DARK: [[f64; 3]; 8] = [
     [0.40, 0.75, 0.78],
 ];
 
-/// Gutter width for a graph with `max_lanes` lanes. Every row uses the same
-/// width so all rows stay aligned (BRANCH.md section 68).
+/// Gutter width for a graph with `max_lanes` lanes. Every row reserves the
+/// same width so graph nodes and commit text stay aligned.
 pub fn width(max_lanes: usize) -> f64 {
     2.0 * GUTTER_PADDING + max_lanes as f64 * LANE_WIDTH
 }
 
-/// Creates the gutter widget for one row.
-///
-/// The area fills the whole row height so the lanes continue without breaks
-/// between rows (BRANCH.md section 35).
-pub fn new(row: &GraphRow, max_lanes: usize, dark: bool) -> DrawingArea {
-    let area = DrawingArea::new();
-    area.set_content_width(width(max_lanes) as i32);
-    area.set_vexpand(true);
-
-    let palette = if dark { PALETTE_DARK } else { PALETTE_LIGHT };
-    let row = row.clone();
-    area.set_draw_func(move |_, context, width, height| {
-        draw(context, width as f64, height as f64, &row, &palette);
-    });
-    area
+struct State {
+    graph: RefCell<Option<HistoryGraph>>,
+    dark: Cell<bool>,
 }
 
-/// Draws the segments and the node of one row.
-fn draw(
+/// One graph canvas shared by all repository History rows.
+pub struct GraphGutter {
+    area: DrawingArea,
+    state: Rc<State>,
+}
+
+impl GraphGutter {
+    pub fn new(list: &ListBox) -> Self {
+        let area = DrawingArea::new();
+        area.set_halign(Align::Start);
+        area.set_valign(Align::Fill);
+        area.set_vexpand(true);
+        area.set_can_target(false);
+        area.set_focusable(false);
+        area.set_visible(false);
+
+        let state = Rc::new(State {
+            graph: RefCell::new(None),
+            dark: Cell::new(false),
+        });
+
+        let list = list.downgrade();
+        let draw_state = state.clone();
+        area.set_draw_func(move |_, context, _, height| {
+            let Some(list) = list.upgrade() else {
+                return;
+            };
+            let graph = draw_state.graph.borrow();
+            let Some(graph) = graph.as_ref() else {
+                return;
+            };
+            let palette = if draw_state.dark.get() {
+                &PALETTE_DARK
+            } else {
+                &PALETTE_LIGHT
+            };
+            draw_graph(context, height as f64, &list, graph, palette);
+        });
+
+        Self { area, state }
+    }
+
+    pub fn widget(&self) -> &DrawingArea {
+        &self.area
+    }
+
+    /// Replaces the graph shown by the canvas. `None` is used by File History,
+    /// which intentionally has no commit graph.
+    pub fn update(&self, graph: Option<&HistoryGraph>, dark: bool) {
+        self.state.dark.set(dark);
+        *self.state.graph.borrow_mut() = graph.cloned();
+
+        if let Some(graph) = graph {
+            self.area.set_content_width(width(graph.max_lanes) as i32);
+            self.area.set_visible(!graph.rows.is_empty());
+        } else {
+            self.area.set_visible(false);
+        }
+        self.area.queue_draw();
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RowGeometry {
+    top: f64,
+    center: f64,
+    bottom: f64,
+}
+
+/// Draws all loaded commit rows in one Cairo surface.
+///
+/// Every palette color is stroked exactly once. Adjacent logical rows therefore
+/// become parts of one Cairo paint operation instead of two separately
+/// composited strokes meeting at the same coordinate. This removes both the
+/// faint butt-cap seam and the darker square-cap overlap.
+fn draw_graph(
     context: &cairo::Context,
-    _width: f64,
-    height: f64,
-    row: &GraphRow,
+    canvas_height: f64,
+    list: &ListBox,
+    graph: &HistoryGraph,
     palette: &[[f64; 3]; 8],
 ) {
-    let center_y = height / 2.0;
+    let mut bounds = Vec::with_capacity(graph.rows.len());
+    for index in 0..graph.rows.len() {
+        let Some(row) = list.row_at_index(index as i32) else {
+            break;
+        };
+        let Some(rect) = row.compute_bounds(list) else {
+            break;
+        };
+        let top = f64::from(rect.y());
+        bounds.push((top, top + f64::from(rect.height())));
+    }
+
+    if bounds.is_empty() {
+        return;
+    }
+
+    let mut geometry = Vec::with_capacity(bounds.len());
+    for index in 0..bounds.len() {
+        let (row_top, row_bottom) = bounds[index];
+        let top = if index == 0 {
+            row_top.max(0.0)
+        } else {
+            (bounds[index - 1].1 + row_top) / 2.0
+        };
+        let bottom = if index + 1 == bounds.len() {
+            row_bottom.min(canvas_height)
+        } else {
+            (row_bottom + bounds[index + 1].0) / 2.0
+        };
+        geometry.push(RowGeometry {
+            top,
+            center: (row_top + row_bottom) / 2.0,
+            bottom,
+        });
+    }
+
     let lane_x = |lane: usize| GUTTER_PADDING + LANE_WIDTH / 2.0 + lane as f64 * LANE_WIDTH;
 
     context.set_line_width(EDGE_WIDTH);
-    // Every row owns a separate DrawingArea. Round caps ending exactly at the
-    // clipping edge are only partially rasterized, which leaves a faint seam
-    // where two otherwise continuous lane segments meet. Square caps extend
-    // half a stroke beyond the row and are clipped flush, so adjacent rows
-    // join at full opacity without changing the curve geometry.
     context.set_line_cap(LineCap::Square);
     context.set_line_join(LineJoin::Round);
 
-    // Segments first: the node covers their endpoints.  Top/bottom coordinates
-    // deliberately live outside the DrawingArea so independently rendered rows
-    // meet with a fully opaque stroke at the shared boundary.
-    let top_y = -EDGE_OVERDRAW;
-    let bottom_y = height + EDGE_OVERDRAW;
-    let mut has_incoming = false;
-    let mut has_outgoing = false;
-    for edge in &row.edges {
-        let color = palette[edge.color_slot % palette.len()];
-        context.set_source_rgb(color[0], color[1], color[2]);
-        match (edge.from, edge.to) {
-            (GraphPoint::Top(from), GraphPoint::Bottom(to)) => {
-                segment(context, lane_x(from), top_y, lane_x(to), bottom_y);
-                context.stroke().ok();
-                seal_top_boundary(context, lane_x(from));
-                seal_bottom_boundary(context, lane_x(to), height);
+    // Build one path per visible palette color and stroke it once. Individual
+    // graph edges remain separate Cairo subpaths, but overlaps at row
+    // boundaries are rasterized into one mask and composited only once.
+    for color_index in 0..palette.len() {
+        context.new_path();
+        let mut has_segments = false;
+
+        for (row, geometry) in graph.rows.iter().zip(&geometry) {
+            for edge in &row.edges {
+                if edge.color_slot % palette.len() != color_index {
+                    continue;
+                }
+
+                match (edge.from, edge.to) {
+                    (GraphPoint::Top(from), GraphPoint::Bottom(to)) => {
+                        segment(
+                            context,
+                            lane_x(from),
+                            geometry.top,
+                            lane_x(to),
+                            geometry.bottom,
+                        );
+                    }
+                    (GraphPoint::Top(from), GraphPoint::Node) => {
+                        segment(
+                            context,
+                            lane_x(from),
+                            geometry.top,
+                            lane_x(row.node.lane),
+                            geometry.center,
+                        );
+                    }
+                    (GraphPoint::Node, GraphPoint::Bottom(to)) => {
+                        segment(
+                            context,
+                            lane_x(row.node.lane),
+                            geometry.center,
+                            lane_x(to),
+                            geometry.bottom,
+                        );
+                    }
+                    _ => continue,
+                }
+                has_segments = true;
             }
-            (GraphPoint::Top(from), GraphPoint::Node) => {
-                has_incoming = true;
-                segment(context, lane_x(from), top_y, lane_x(row.node.lane), center_y);
-                context.stroke().ok();
-                seal_top_boundary(context, lane_x(from));
-            }
-            (GraphPoint::Node, GraphPoint::Bottom(to)) => {
-                has_outgoing = true;
-                segment(context, lane_x(row.node.lane), center_y, lane_x(to), bottom_y);
-                context.stroke().ok();
-                seal_bottom_boundary(context, lane_x(to), height);
-            }
-            _ => {}
+        }
+
+        if has_segments {
+            let color = palette[color_index];
+            context.set_source_rgb(color[0], color[1], color[2]);
+            context.stroke().ok();
         }
     }
 
-    let node_color = palette[row.node.color_slot % palette.len()];
-    context.set_source_rgb(node_color[0], node_color[1], node_color[2]);
-
-    // The line of a root commit ends just below its node (BRANCH.md section 38).
-    // It is not a row-boundary continuation, so keep the rounded terminal cap.
+    // Root tails terminate inside a row rather than at a row boundary, so draw
+    // them separately with the original rounded end cap.
+    context.set_line_width(EDGE_WIDTH);
     context.set_line_cap(LineCap::Round);
-    if has_incoming && !has_outgoing {
-        context.move_to(lane_x(row.node.lane), center_y);
+    for (row, geometry) in graph.rows.iter().zip(&geometry) {
+        let has_incoming = row
+            .edges
+            .iter()
+            .any(|edge| matches!(edge.to, GraphPoint::Node));
+        let has_outgoing = row
+            .edges
+            .iter()
+            .any(|edge| matches!(edge.from, GraphPoint::Node));
+        if !has_incoming || has_outgoing {
+            continue;
+        }
+
+        let color = palette[row.node.color_slot % palette.len()];
+        context.set_source_rgb(color[0], color[1], color[2]);
+        context.move_to(lane_x(row.node.lane), geometry.center);
         context.line_to(
             lane_x(row.node.lane),
-            (center_y + 2.0 * NODE_RADIUS).min(height),
+            (geometry.center + 2.0 * NODE_RADIUS).min(geometry.bottom),
         );
         context.stroke().ok();
     }
 
-    // The commit node (BRANCH.md section 37).
-    let node_x = lane_x(row.node.lane);
-    context.arc(node_x, center_y, NODE_RADIUS, 0.0, std::f64::consts::TAU);
-    context.fill().ok();
+    // Nodes are painted last so they cover edge endpoints exactly as before.
+    for (row, geometry) in graph.rows.iter().zip(&geometry) {
+        let node_color = palette[row.node.color_slot % palette.len()];
+        context.set_source_rgb(node_color[0], node_color[1], node_color[2]);
 
-    // A ring marks merge commits.
-    if matches!(row.node.kind, GraphNodeKind::Merge) {
-        context.set_line_width(1.5);
+        let node_x = lane_x(row.node.lane);
         context.arc(
             node_x,
-            center_y,
-            NODE_RADIUS + 1.5,
+            geometry.center,
+            NODE_RADIUS,
             0.0,
             std::f64::consts::TAU,
         );
-        context.stroke().ok();
+        context.fill().ok();
+
+        if matches!(row.node.kind, GraphNodeKind::Merge) {
+            context.set_line_width(1.5);
+            context.arc(
+                node_x,
+                geometry.center,
+                NODE_RADIUS + 1.5,
+                0.0,
+                std::f64::consts::TAU,
+            );
+            context.stroke().ok();
+        }
     }
-}
-
-/// Paints the first logical pixel of a lane at a row boundary at full opacity.
-///
-/// GTK composites each row's DrawingArea independently. Even when the stroke is
-/// overdrawn past the clip, the clip edge can still slightly attenuate the
-/// boundary pixel. Filling the first/last in-row pixel explicitly removes that
-/// final hairline without changing the visible lane geometry.
-fn seal_top_boundary(context: &cairo::Context, x: f64) {
-    context.rectangle(x - EDGE_WIDTH / 2.0, 0.0, EDGE_WIDTH, 1.0);
-    context.fill().ok();
-}
-
-fn seal_bottom_boundary(context: &cairo::Context, x: f64, height: f64) {
-    context.rectangle(
-        x - EDGE_WIDTH / 2.0,
-        (height - 1.0).max(0.0),
-        EDGE_WIDTH,
-        1.0,
-    );
-    context.fill().ok();
 }
 
 /// Strokes a segment between two points: vertical when the lane continues,

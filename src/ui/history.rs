@@ -11,9 +11,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use gtk4::pango;
 use gtk4::prelude::*;
-use gtk4::{Box as GtkBox, Button, Label, ListBox, ListBoxRow, Orientation, SelectionMode};
+use gtk4::{
+    Box as GtkBox, Button, Label, ListBox, ListBoxRow, Orientation, Overlay, SelectionMode,
+};
 
-use crate::graph::{GraphRow, HistoryGraph};
+use crate::graph::HistoryGraph;
 use crate::model::commit::Commit;
 use crate::model::refs::{CommitRef, HeadRef, RefKind};
 use crate::ui::clipboard::{self, CopyAction};
@@ -46,6 +48,7 @@ pub struct HistoryView {
     header: Label,
     path_label: Label,
     all_button: Button,
+    graph_gutter: graph_gutter::GraphGutter,
     shared: Rc<Shared>,
 }
 
@@ -79,7 +82,15 @@ impl HistoryView {
         list.add_css_class("navigation-sidebar");
         list.add_css_class("history-graph-list");
         list.set_activate_on_single_click(true);
-        root.append(&list);
+
+        // The graph is one canvas over the whole ListBox. Commit rows reserve
+        // its horizontal width, but lane rendering is no longer clipped and
+        // rasterized independently for every row.
+        let graph_gutter = graph_gutter::GraphGutter::new(&list);
+        let list_overlay = Overlay::new();
+        list_overlay.set_child(Some(&list));
+        list_overlay.add_overlay(graph_gutter.widget());
+        root.append(&list_overlay);
 
         let shared = Rc::new(Shared {
             items: RefCell::new(Vec::new()),
@@ -119,6 +130,7 @@ impl HistoryView {
             header,
             path_label,
             all_button,
+            graph_gutter,
             shared,
         }
     }
@@ -174,15 +186,10 @@ impl HistoryView {
         let mut items = self.shared.items.borrow_mut();
         items.clear();
 
-        for (commit, row_graph) in commits.iter().zip(&graph.rows) {
-            self.push_commit(
-                commit,
-                file_path.is_none().then_some(row_graph),
-                graph.max_lanes,
-                refs,
-                head,
-                dark,
-            );
+        let graph_width =
+            file_path.is_none().then(|| graph_gutter::width(graph.max_lanes) as i32);
+        for commit in commits {
+            self.push_commit(commit, graph_width, refs, head);
             items.push(Some(Selection::Commit(commit.oid.clone())));
         }
         if commits.is_empty() && exhausted && file_path.is_some() {
@@ -212,26 +219,29 @@ impl HistoryView {
 
         drop(items);
         self.shared.rebuilding.set(false);
+        self.graph_gutter
+            .update(file_path.is_none().then_some(graph), dark);
     }
 
-    /// Appends one commit row: graph gutter plus commit information.
+    /// Appends one commit row, reserving graph gutter width when the
+    /// repository graph canvas is visible.
     fn push_commit(
         &self,
         commit: &Commit,
-        row_graph: Option<&GraphRow>,
-        max_lanes: usize,
+        graph_width: Option<i32>,
         refs: &HashMap<String, Vec<CommitRef>>,
         head: Option<&HeadRef>,
-        dark: bool,
     ) {
         let row = ListBoxRow::new();
         row.set_activatable(true);
 
-        // The gutter has no margins: it must cover the whole row height so the
-        // lanes never break between rows (BRANCH.md section 35).
         let outer = GtkBox::new(Orientation::Horizontal, 0);
-        if let Some(row_graph) = row_graph {
-            outer.append(&graph_gutter::new(row_graph, max_lanes, dark));
+        if let Some(graph_width) = graph_width {
+            // The actual graph is an overlay canvas. This empty box reserves
+            // exactly the same horizontal space inside every commit row.
+            let spacer = GtkBox::new(Orientation::Horizontal, 0);
+            spacer.set_width_request(graph_width);
+            outer.append(&spacer);
         }
 
         let box_ = GtkBox::new(Orientation::Vertical, 2);
