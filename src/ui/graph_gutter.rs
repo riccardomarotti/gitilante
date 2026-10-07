@@ -193,10 +193,12 @@ fn draw_row(
     let lane_x = |lane: usize| GUTTER_PADDING + LANE_WIDTH / 2.0 + lane as f64 * LANE_WIDTH;
 
     context.set_line_width(EDGE_WIDTH);
-    // Adjacent row segments share one coordinate in the same Cairo surface.
-    // Square caps overlap by half a stroke at that coordinate, making the join
-    // fully opaque without any row-boundary clipping tricks.
-    context.set_line_cap(LineCap::Square);
+    // All rows are now painted into the same Cairo surface and adjacent
+    // segments share the exact same boundary coordinate. Square caps would
+    // extend half a stroke past that coordinate, so two neighbouring rows
+    // overlap and leave a visible little joint. Butt caps meet exactly at the
+    // shared boundary with no overlap and no per-widget clipping seam.
+    context.set_line_cap(LineCap::Butt);
     context.set_line_join(LineJoin::Round);
 
     // Segments first: the node covers their endpoints.
