@@ -81,7 +81,12 @@ fn draw(
     let lane_x = |lane: usize| GUTTER_PADDING + LANE_WIDTH / 2.0 + lane as f64 * LANE_WIDTH;
 
     context.set_line_width(EDGE_WIDTH);
-    context.set_line_cap(LineCap::Round);
+    // Every row owns a separate DrawingArea. Round caps ending exactly at the
+    // clipping edge are only partially rasterized, which leaves a faint seam
+    // where two otherwise continuous lane segments meet. Square caps extend
+    // half a stroke beyond the row and are clipped flush, so adjacent rows
+    // join at full opacity without changing the curve geometry.
+    context.set_line_cap(LineCap::Square);
     context.set_line_join(LineJoin::Round);
 
     // Segments first: the node covers their endpoints.
@@ -111,6 +116,8 @@ fn draw(
     context.set_source_rgb(node_color[0], node_color[1], node_color[2]);
 
     // The line of a root commit ends just below its node (BRANCH.md section 38).
+    // It is not a row-boundary continuation, so keep the rounded terminal cap.
+    context.set_line_cap(LineCap::Round);
     if has_incoming && !has_outgoing {
         context.move_to(lane_x(row.node.lane), center_y);
         context.line_to(
