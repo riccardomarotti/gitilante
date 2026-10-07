@@ -30,6 +30,17 @@ const BADGE_CSS: &str = r#"
     background-color: alpha(@accent_bg_color, 0.22);
     font-weight: bold;
 }
+
+/* The navigation-sidebar style adds vertical spacing around rows.  History
+ * graph gutters are one DrawingArea per row, so that spacing would show up
+ * as a small break in otherwise continuous lanes.  The commit content keeps
+ * its own vertical margins; remove only the row-level vertical gap here. */
+.history-graph-list > row {
+    margin-top: 0;
+    margin-bottom: 0;
+    padding-top: 0;
+    padding-bottom: 0;
+}
 "#;
 
 /// The single-key hunk shortcuts (SPEC section 30) are suspended while a search

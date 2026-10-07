@@ -77,6 +77,7 @@ impl HistoryView {
         let list = ListBox::new();
         list.set_selection_mode(SelectionMode::Single);
         list.add_css_class("navigation-sidebar");
+        list.add_css_class("history-graph-list");
         list.set_activate_on_single_click(true);
         root.append(&list);
 
