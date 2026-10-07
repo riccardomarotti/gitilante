@@ -107,18 +107,24 @@ fn draw(
         match (edge.from, edge.to) {
             (GraphPoint::Top(from), GraphPoint::Bottom(to)) => {
                 segment(context, lane_x(from), top_y, lane_x(to), bottom_y);
+                context.stroke().ok();
+                seal_top_boundary(context, lane_x(from));
+                seal_bottom_boundary(context, lane_x(to), height);
             }
             (GraphPoint::Top(from), GraphPoint::Node) => {
                 has_incoming = true;
                 segment(context, lane_x(from), top_y, lane_x(row.node.lane), center_y);
+                context.stroke().ok();
+                seal_top_boundary(context, lane_x(from));
             }
             (GraphPoint::Node, GraphPoint::Bottom(to)) => {
                 has_outgoing = true;
                 segment(context, lane_x(row.node.lane), center_y, lane_x(to), bottom_y);
+                context.stroke().ok();
+                seal_bottom_boundary(context, lane_x(to), height);
             }
             _ => {}
         }
-        context.stroke().ok();
     }
 
     let node_color = palette[row.node.color_slot % palette.len()];
@@ -153,6 +159,27 @@ fn draw(
         );
         context.stroke().ok();
     }
+}
+
+/// Paints the first logical pixel of a lane at a row boundary at full opacity.
+///
+/// GTK composites each row's DrawingArea independently. Even when the stroke is
+/// overdrawn past the clip, the clip edge can still slightly attenuate the
+/// boundary pixel. Filling the first/last in-row pixel explicitly removes that
+/// final hairline without changing the visible lane geometry.
+fn seal_top_boundary(context: &cairo::Context, x: f64) {
+    context.rectangle(x - EDGE_WIDTH / 2.0, 0.0, EDGE_WIDTH, 1.0);
+    context.fill().ok();
+}
+
+fn seal_bottom_boundary(context: &cairo::Context, x: f64, height: f64) {
+    context.rectangle(
+        x - EDGE_WIDTH / 2.0,
+        (height - 1.0).max(0.0),
+        EDGE_WIDTH,
+        1.0,
+    );
+    context.fill().ok();
 }
 
 /// Strokes a segment between two points: vertical when the lane continues,
