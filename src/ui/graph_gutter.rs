@@ -17,6 +17,11 @@ const LANE_WIDTH: f64 = 16.0;
 const NODE_RADIUS: f64 = 4.0;
 /// Width of the lane segments (BRANCH.md section 34).
 const EDGE_WIDTH: f64 = 2.0;
+/// Extend row-to-row edges beyond the DrawingArea clip. Each History row is
+/// rasterized independently; ending a stroked path exactly on the clip boundary
+/// can leave a one-pixel antialias seam even with square caps. Overdrawing keeps
+/// the boundary in the middle of the stroke, then GTK clips it flush.
+const EDGE_OVERDRAW: f64 = EDGE_WIDTH;
 /// Padding around the lanes (BRANCH.md section 34).
 const GUTTER_PADDING: f64 = 6.0;
 
@@ -89,7 +94,11 @@ fn draw(
     context.set_line_cap(LineCap::Square);
     context.set_line_join(LineJoin::Round);
 
-    // Segments first: the node covers their endpoints.
+    // Segments first: the node covers their endpoints.  Top/bottom coordinates
+    // deliberately live outside the DrawingArea so independently rendered rows
+    // meet with a fully opaque stroke at the shared boundary.
+    let top_y = -EDGE_OVERDRAW;
+    let bottom_y = height + EDGE_OVERDRAW;
     let mut has_incoming = false;
     let mut has_outgoing = false;
     for edge in &row.edges {
@@ -97,15 +106,15 @@ fn draw(
         context.set_source_rgb(color[0], color[1], color[2]);
         match (edge.from, edge.to) {
             (GraphPoint::Top(from), GraphPoint::Bottom(to)) => {
-                segment(context, lane_x(from), 0.0, lane_x(to), height);
+                segment(context, lane_x(from), top_y, lane_x(to), bottom_y);
             }
             (GraphPoint::Top(from), GraphPoint::Node) => {
                 has_incoming = true;
-                segment(context, lane_x(from), 0.0, lane_x(row.node.lane), center_y);
+                segment(context, lane_x(from), top_y, lane_x(row.node.lane), center_y);
             }
             (GraphPoint::Node, GraphPoint::Bottom(to)) => {
                 has_outgoing = true;
-                segment(context, lane_x(row.node.lane), center_y, lane_x(to), height);
+                segment(context, lane_x(row.node.lane), center_y, lane_x(to), bottom_y);
             }
             _ => {}
         }
