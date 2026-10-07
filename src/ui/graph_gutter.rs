@@ -131,10 +131,10 @@ struct RowGeometry {
 
 /// Draws all loaded commit rows in one Cairo surface.
 ///
-/// The seam between two logical graph rows is defined once and shared by both
-/// rows. Even if the ListBox theme leaves fractional spacing between widgets,
-/// the outgoing edge above and incoming edge below meet at exactly the same
-/// coordinate.
+/// Every palette color is stroked exactly once. Adjacent logical rows therefore
+/// become parts of one Cairo paint operation instead of two separately
+/// composited strokes meeting at the same coordinate. This removes both the
+/// faint butt-cap seam and the darker square-cap overlap.
 fn draw_graph(
     context: &cairo::Context,
     canvas_height: f64,
@@ -178,76 +178,85 @@ fn draw_graph(
         });
     }
 
-    for (row, geometry) in graph.rows.iter().zip(geometry) {
-        draw_row(context, row, geometry, palette);
-    }
-}
-
-/// Draws the segments and commit node for one logical History row.
-fn draw_row(
-    context: &cairo::Context,
-    row: &GraphRow,
-    geometry: RowGeometry,
-    palette: &[[f64; 3]; 8],
-) {
     let lane_x = |lane: usize| GUTTER_PADDING + LANE_WIDTH / 2.0 + lane as f64 * LANE_WIDTH;
 
     context.set_line_width(EDGE_WIDTH);
-    // All rows are now painted into the same Cairo surface and adjacent
-    // segments share the exact same boundary coordinate. Square caps would
-    // extend half a stroke past that coordinate, so two neighbouring rows
-    // overlap and leave a visible little joint. Butt caps meet exactly at the
-    // shared boundary with no overlap and no per-widget clipping seam.
-    context.set_line_cap(LineCap::Butt);
+    context.set_line_cap(LineCap::Square);
     context.set_line_join(LineJoin::Round);
 
-    // Segments first: the node covers their endpoints.
-    let mut has_incoming = false;
-    let mut has_outgoing = false;
-    for edge in &row.edges {
-        let color = palette[edge.color_slot % palette.len()];
-        context.set_source_rgb(color[0], color[1], color[2]);
-        match (edge.from, edge.to) {
-            (GraphPoint::Top(from), GraphPoint::Bottom(to)) => {
-                segment(
-                    context,
-                    lane_x(from),
-                    geometry.top,
-                    lane_x(to),
-                    geometry.bottom,
-                );
+    // Build one path per visible palette color and stroke it once. Individual
+    // graph edges remain separate Cairo subpaths, but overlaps at row
+    // boundaries are rasterized into one mask and composited only once.
+    for color_index in 0..palette.len() {
+        context.new_path();
+        let mut has_segments = false;
+
+        for (row, geometry) in graph.rows.iter().zip(&geometry) {
+            for edge in &row.edges {
+                if edge.color_slot % palette.len() != color_index {
+                    continue;
+                }
+
+                match (edge.from, edge.to) {
+                    (GraphPoint::Top(from), GraphPoint::Bottom(to)) => {
+                        segment(
+                            context,
+                            lane_x(from),
+                            geometry.top,
+                            lane_x(to),
+                            geometry.bottom,
+                        );
+                    }
+                    (GraphPoint::Top(from), GraphPoint::Node) => {
+                        segment(
+                            context,
+                            lane_x(from),
+                            geometry.top,
+                            lane_x(row.node.lane),
+                            geometry.center,
+                        );
+                    }
+                    (GraphPoint::Node, GraphPoint::Bottom(to)) => {
+                        segment(
+                            context,
+                            lane_x(row.node.lane),
+                            geometry.center,
+                            lane_x(to),
+                            geometry.bottom,
+                        );
+                    }
+                    _ => continue,
+                }
+                has_segments = true;
             }
-            (GraphPoint::Top(from), GraphPoint::Node) => {
-                has_incoming = true;
-                segment(
-                    context,
-                    lane_x(from),
-                    geometry.top,
-                    lane_x(row.node.lane),
-                    geometry.center,
-                );
-            }
-            (GraphPoint::Node, GraphPoint::Bottom(to)) => {
-                has_outgoing = true;
-                segment(
-                    context,
-                    lane_x(row.node.lane),
-                    geometry.center,
-                    lane_x(to),
-                    geometry.bottom,
-                );
-            }
-            _ => continue,
         }
-        context.stroke().ok();
+
+        if has_segments {
+            let color = palette[color_index];
+            context.set_source_rgb(color[0], color[1], color[2]);
+            context.stroke().ok();
+        }
     }
 
-    let node_color = palette[row.node.color_slot % palette.len()];
-    context.set_source_rgb(node_color[0], node_color[1], node_color[2]);
+    // Root tails terminate inside a row rather than at a row boundary, so draw
+    // them separately with the original rounded end cap.
+    context.set_line_width(EDGE_WIDTH);
+    context.set_line_cap(LineCap::Round);
+    for (row, geometry) in graph.rows.iter().zip(&geometry) {
+        let has_incoming = row
+            .edges
+            .iter()
+            .any(|edge| matches!(edge.to, GraphPoint::Node));
+        let has_outgoing = row
+            .edges
+            .iter()
+            .any(|edge| matches!(edge.from, GraphPoint::Node));
+        if !has_incoming || has_outgoing {
+            continue;
+        }
 
-    // The line of a root commit ends just below its node (BRANCH.md section 38).
-    if has_incoming && !has_outgoing {
-        context.set_line_cap(LineCap::Round);
+        let color = palette[row.node.color_slot % palette.len()];
+        context.set_source_rgb(color[0], color[1], color[2]);
         context.move_to(lane_x(row.node.lane), geometry.center);
         context.line_to(
             lane_x(row.node.lane),
@@ -256,28 +265,32 @@ fn draw_row(
         context.stroke().ok();
     }
 
-    // The commit node (BRANCH.md section 37).
-    let node_x = lane_x(row.node.lane);
-    context.arc(
-        node_x,
-        geometry.center,
-        NODE_RADIUS,
-        0.0,
-        std::f64::consts::TAU,
-    );
-    context.fill().ok();
+    // Nodes are painted last so they cover edge endpoints exactly as before.
+    for (row, geometry) in graph.rows.iter().zip(&geometry) {
+        let node_color = palette[row.node.color_slot % palette.len()];
+        context.set_source_rgb(node_color[0], node_color[1], node_color[2]);
 
-    // A ring marks merge commits.
-    if matches!(row.node.kind, GraphNodeKind::Merge) {
-        context.set_line_width(1.5);
+        let node_x = lane_x(row.node.lane);
         context.arc(
             node_x,
             geometry.center,
-            NODE_RADIUS + 1.5,
+            NODE_RADIUS,
             0.0,
             std::f64::consts::TAU,
         );
-        context.stroke().ok();
+        context.fill().ok();
+
+        if matches!(row.node.kind, GraphNodeKind::Merge) {
+            context.set_line_width(1.5);
+            context.arc(
+                node_x,
+                geometry.center,
+                NODE_RADIUS + 1.5,
+                0.0,
+                std::f64::consts::TAU,
+            );
+            context.stroke().ok();
+        }
     }
 }
 
