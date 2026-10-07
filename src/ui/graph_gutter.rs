@@ -17,6 +17,11 @@ const LANE_WIDTH: f64 = 16.0;
 const NODE_RADIUS: f64 = 4.0;
 /// Width of the lane segments (BRANCH.md section 34).
 const EDGE_WIDTH: f64 = 2.0;
+/// Extend row-to-row edges beyond the DrawingArea clip. Each History row is
+/// rasterized independently; ending a stroked path exactly on the clip boundary
+/// can leave a one-pixel antialias seam even with square caps. Overdrawing keeps
+/// the boundary in the middle of the stroke, then GTK clips it flush.
+const EDGE_OVERDRAW: f64 = EDGE_WIDTH;
 /// Padding around the lanes (BRANCH.md section 34).
 const GUTTER_PADDING: f64 = 6.0;
 
@@ -81,10 +86,19 @@ fn draw(
     let lane_x = |lane: usize| GUTTER_PADDING + LANE_WIDTH / 2.0 + lane as f64 * LANE_WIDTH;
 
     context.set_line_width(EDGE_WIDTH);
-    context.set_line_cap(LineCap::Round);
+    // Every row owns a separate DrawingArea. Round caps ending exactly at the
+    // clipping edge are only partially rasterized, which leaves a faint seam
+    // where two otherwise continuous lane segments meet. Square caps extend
+    // half a stroke beyond the row and are clipped flush, so adjacent rows
+    // join at full opacity without changing the curve geometry.
+    context.set_line_cap(LineCap::Square);
     context.set_line_join(LineJoin::Round);
 
-    // Segments first: the node covers their endpoints.
+    // Segments first: the node covers their endpoints.  Top/bottom coordinates
+    // deliberately live outside the DrawingArea so independently rendered rows
+    // meet with a fully opaque stroke at the shared boundary.
+    let top_y = -EDGE_OVERDRAW;
+    let bottom_y = height + EDGE_OVERDRAW;
     let mut has_incoming = false;
     let mut has_outgoing = false;
     for edge in &row.edges {
@@ -92,25 +106,33 @@ fn draw(
         context.set_source_rgb(color[0], color[1], color[2]);
         match (edge.from, edge.to) {
             (GraphPoint::Top(from), GraphPoint::Bottom(to)) => {
-                segment(context, lane_x(from), 0.0, lane_x(to), height);
+                segment(context, lane_x(from), top_y, lane_x(to), bottom_y);
+                context.stroke().ok();
+                seal_top_boundary(context, lane_x(from));
+                seal_bottom_boundary(context, lane_x(to), height);
             }
             (GraphPoint::Top(from), GraphPoint::Node) => {
                 has_incoming = true;
-                segment(context, lane_x(from), 0.0, lane_x(row.node.lane), center_y);
+                segment(context, lane_x(from), top_y, lane_x(row.node.lane), center_y);
+                context.stroke().ok();
+                seal_top_boundary(context, lane_x(from));
             }
             (GraphPoint::Node, GraphPoint::Bottom(to)) => {
                 has_outgoing = true;
-                segment(context, lane_x(row.node.lane), center_y, lane_x(to), height);
+                segment(context, lane_x(row.node.lane), center_y, lane_x(to), bottom_y);
+                context.stroke().ok();
+                seal_bottom_boundary(context, lane_x(to), height);
             }
             _ => {}
         }
-        context.stroke().ok();
     }
 
     let node_color = palette[row.node.color_slot % palette.len()];
     context.set_source_rgb(node_color[0], node_color[1], node_color[2]);
 
     // The line of a root commit ends just below its node (BRANCH.md section 38).
+    // It is not a row-boundary continuation, so keep the rounded terminal cap.
+    context.set_line_cap(LineCap::Round);
     if has_incoming && !has_outgoing {
         context.move_to(lane_x(row.node.lane), center_y);
         context.line_to(
@@ -137,6 +159,27 @@ fn draw(
         );
         context.stroke().ok();
     }
+}
+
+/// Paints the first logical pixel of a lane at a row boundary at full opacity.
+///
+/// GTK composites each row's DrawingArea independently. Even when the stroke is
+/// overdrawn past the clip, the clip edge can still slightly attenuate the
+/// boundary pixel. Filling the first/last in-row pixel explicitly removes that
+/// final hairline without changing the visible lane geometry.
+fn seal_top_boundary(context: &cairo::Context, x: f64) {
+    context.rectangle(x - EDGE_WIDTH / 2.0, 0.0, EDGE_WIDTH, 1.0);
+    context.fill().ok();
+}
+
+fn seal_bottom_boundary(context: &cairo::Context, x: f64, height: f64) {
+    context.rectangle(
+        x - EDGE_WIDTH / 2.0,
+        (height - 1.0).max(0.0),
+        EDGE_WIDTH,
+        1.0,
+    );
+    context.fill().ok();
 }
 
 /// Strokes a segment between two points: vertical when the lane continues,
