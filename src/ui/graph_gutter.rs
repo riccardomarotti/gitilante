@@ -12,7 +12,7 @@ use gtk4::cairo::{self, LineCap, LineJoin};
 use gtk4::prelude::*;
 use gtk4::{Align, DrawingArea, ListBox};
 
-use crate::graph::{GraphNodeKind, GraphPoint, GraphRow, HistoryGraph};
+use crate::graph::{GraphNodeKind, GraphPoint, HistoryGraph};
 
 /// Horizontal distance between two lanes (BRANCH.md section 34).
 const LANE_WIDTH: f64 = 16.0;
