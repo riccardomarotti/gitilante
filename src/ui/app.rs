@@ -31,19 +31,13 @@ const BADGE_CSS: &str = r#"
     font-weight: bold;
 }
 
-/* The navigation-sidebar style adds vertical spacing around rows.  History
- * graph gutters are one DrawingArea per row, so that spacing would show up
- * as a small break in otherwise continuous lanes.  The commit content keeps
- * its own vertical margins; remove only the row-level vertical gap here. */
+/* Keep repository History rows flush. The commit graph is now rendered by
+ * one overlay canvas, while the row content keeps its own vertical margins. */
 .history-graph-list > row {
     margin-top: 0;
     margin-bottom: 0;
     padding-top: 0;
     padding-bottom: 0;
-
-    /* GTK/libadwaita may paint a subtle one-pixel row separator over the
-     * children. It is invisible on the sidebar background but darkens graph
-     * strokes exactly at row boundaries, so suppress it only for History. */
     border-top-width: 0;
     border-bottom-width: 0;
     box-shadow: none;
