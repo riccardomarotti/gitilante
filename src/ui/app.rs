@@ -40,6 +40,13 @@ const BADGE_CSS: &str = r#"
     margin-bottom: 0;
     padding-top: 0;
     padding-bottom: 0;
+
+    /* GTK/libadwaita may paint a subtle one-pixel row separator over the
+     * children. It is invisible on the sidebar background but darkens graph
+     * strokes exactly at row boundaries, so suppress it only for History. */
+    border-top-width: 0;
+    border-bottom-width: 0;
+    box-shadow: none;
 }
 "#;
 
